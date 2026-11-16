@@ -204,9 +204,9 @@ import {
 import { PLAN_MOVES } from "../schema/plan-moves.generated";
 
 it("moves exactly the plans schema/plan-moves.generated.ts holds", async () => {
-  await resetTo(predecessorSql, statsSql); // your own: drop tables, apply DDL
+  await resetTo(predecessorSql); // your own: drop tables, apply DDL, seed stats
   const before = await planSweep(env.DB, queries);
-  await resetTo(schemaSql, statsSql);
+  await resetTo(schemaSql);
   const after = await planSweep(env.DB, queries);
 
   expect(unplannableQueries(after)).toEqual([]);
@@ -223,8 +223,14 @@ it("moves exactly the plans schema/plan-moves.generated.ts holds", async () => {
 ```
 
 Run it with `vitest -u` to accept the moves; the regenerated file's diff is what
-the reviewer reads. Apply the same statistics payload to both sides, so a
-difference is attributable to the schema and nothing else. A statement that
+the reviewer reads. Seed both sides from the same cardinality model, so a
+difference is attributable to the schema and nothing else, but build each
+side's rows against that side's own schema: call `applyProductionStats` after
+each `resetTo`, with `indexes` filtered to the indexes that side holds (and
+`tables` covering every table it holds). Do not apply one rendered payload to
+both: SQLite reads a `sqlite_stat1` row naming an index the schema lacks as the
+table's row count, so a partial index the delta adds would set its table's
+count on the predecessor side. A statement that
 cannot be prepared against the previous schema (it reads a column the delta
 adds) records its error in place of a plan, which counts as a move; one that
 cannot be prepared against the current schema is broken, which
@@ -240,11 +246,15 @@ any differently.
 - Tested on D1 in the Workers test runtime only. Any database object with the
   same `prepare`/`bind`/`all`/`run`/`batch` shape will run, but plan text and
   error messages are D1's, and nothing else is tested.
-- Which tables a statement names is read from its text: the identifier after
-  `FROM`, `JOIN`, `INTO` or `UPDATE`, bare or quoted, with its alias. A
-  schema-qualified name (`main.events`) is not resolved, and a plan row naming
-  a table whose name has characters outside `[A-Za-z0-9_]` is only read through
-  an alias. A table the lint does not resolve has its plan rows skipped.
+- **Supported SQL for the lint.** It is written for the SQL a query builder
+  emits: tables named after `FROM`, `JOIN`, `INTO` or `UPDATE` (bare or
+  quoted, with an alias), explicit `JOIN` syntax, names spelled with the case
+  the schema uses, and table and index names of word characters. Which tables
+  a statement names is read from its text, not parsed, and a table it does not
+  resolve has its plan rows skipped. So outside that scope it can miss a
+  finding. It reads the raw text, so a table named only in a comment or a string
+  literal counts as named. Known issues lists the gaps, including a comment
+  that re-points an alias.
 - `sqlite_stat4` is not available on D1, so range-distribution-aware choices
   are out of reach; the planner works from `sqlite_stat1` row counts.
 - The lint reads what the plan prints. A residual filter on a column outside
@@ -263,6 +273,13 @@ repository.
   `e` to `big`, and a partial-index exemption can then be judged against the
   wrong table's row count. A `GROUP BY` inside a subquery takes the whole
   statement out of the key groups, even when the outer aggregate has none.
+- **More of the lexical reading.** A comma join (`FROM a, b`) resolves only
+  `a`, and a name spelled in a different case from the schema's is not
+  resolved. The range rule skips every statement that starts with `DELETE` or
+  `UPDATE`, including the reads in its subqueries. The SCAN rule reads an
+  index name as its leading word characters, so a quoted name like
+  `"idx-wide"` is read as `idx`, and takes that index's exemption if it is a
+  bounded partial.
 - **A table whose only indexes are partial gets no table-level row.**
   `buildSqliteStat1Rows` writes the table-level (`idx` NULL) row only for a
   table with no index at all, and SQLite takes a table's row count from a
@@ -271,7 +288,8 @@ repository.
 - **A shared statistics payload can misread an index the predecessor lacks.**
   SQLite reads a `sqlite_stat1` row naming an index it does not have as the
   table's row count, so on the predecessor side of a plan-delta sweep a new
-  partial index's stat can set its table's count.
+  partial index's stat can set its table's count. The recipe under "How to
+  use it" avoids this; `renderStatsSql` output is for one schema.
 - **WITHOUT ROWID primary keys get no row.** Their primary-key index has no
   `sqlite_master` entry, so it is neither discovered nor accepted in `indexes`.
 - **The default stat for a composite index is `"<rows> 1"`.** It gives no
