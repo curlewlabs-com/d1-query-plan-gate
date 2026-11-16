@@ -57,7 +57,7 @@ Install it from the GitHub release tarball (it is not published to npm), with
 an exact pin:
 
 ```sh
-bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.2.0/d1-query-plan-gate-0.2.0.tgz
+bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.3.0/d1-query-plan-gate-0.3.0.tgz
 ```
 
 The package ships TypeScript sources; Vitest, Wrangler and Bun compile them.
@@ -90,11 +90,14 @@ await applyProductionStats(env.DB, MODEL);
 Every user table must appear in `tables`: a table the model does not know
 throws, rather than planning at the default heuristic while the rest of the
 suite claims production shape. An index absent from `indexes` gets
-`"<table rows> 1"`. A WITHOUT ROWID table's primary key is an index too, which
+`"<table rows> 1 ... 1"`, one `1` per key column (each key prefix assumed
+unique), and every table also gets a table-level row with its count, which is
+what a table whose indexes are all partial plans from. A WITHOUT ROWID table's primary key is an index too, which
 SQLite records under the table's own name, so `indexes` keys it by the table
 name; `applyProductionStats` finds it from `pragma_table_list`, and a caller
-enumerating indexes itself for `buildSqliteStat1Rows` passes it as
-`{ name: table, tbl_name: table }`.
+enumerating indexes itself for `buildSqliteStat1Rows` passes each index's key
+width as `columns` (the row count of `pragma_index_info`), and a WITHOUT ROWID
+key as `{ name: table, tbl_name: table, columns: <primary-key columns> }`.
 
 For the live database, render the same rows as a payload and apply it at
 deploy time (`wrangler d1 execute --file`):
@@ -291,21 +294,6 @@ any differently.
   moving window, is invisible to it; only a measured rows-read budget catches
   those.
 - Version 0.x carries no compatibility promise between minor versions.
-
-## Known issues
-
-These are in the code as it was extracted, and are tracked as issues on this
-repository.
-
-- **A table whose only indexes are partial gets no table-level row.**
-  `buildSqliteStat1Rows` writes the table-level (`idx` NULL) row only for a
-  table with no index at all, and SQLite takes a table's row count from a
-  non-partial index's row, so such a table plans at SQLite's default
-  estimate.
-- **The default stat for a composite index is `"<rows> 1"`.** It gives no
-  estimate for the longer key prefixes, which keep whatever SQLite held
-  before. Give a composite index whose plans matter a full entry in
-  `indexes`.
 
 ## License
 
