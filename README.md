@@ -253,6 +253,32 @@ any differently.
   those.
 - Version 0.x carries no compatibility promise between minor versions.
 
+## Known issues
+
+These are in the code as it was extracted, and are tracked as issues on this
+repository.
+
+- **Table resolution is lexical** (see Limits). A table or alias named inside a
+  comment is read as if it were SQL, so `FROM events e /* JOIN big e */` maps
+  `e` to `big`, and a partial-index exemption can then be judged against the
+  wrong table's row count. A `GROUP BY` inside a subquery takes the whole
+  statement out of the key groups, even when the outer aggregate has none.
+- **A table whose only indexes are partial gets no table-level row.**
+  `buildSqliteStat1Rows` writes the table-level (`idx` NULL) row only for a
+  table with no index at all, and SQLite takes a table's row count from a
+  non-partial index's row, so such a table plans at SQLite's default
+  estimate.
+- **A shared statistics payload can misread an index the predecessor lacks.**
+  SQLite reads a `sqlite_stat1` row naming an index it does not have as the
+  table's row count, so on the predecessor side of a plan-delta sweep a new
+  partial index's stat can set its table's count.
+- **WITHOUT ROWID primary keys get no row.** Their primary-key index has no
+  `sqlite_master` entry, so it is neither discovered nor accepted in `indexes`.
+- **The default stat for a composite index is `"<rows> 1"`.** It gives no
+  estimate for the longer key prefixes, which keep whatever SQLite held
+  before. Give a composite index whose plans matter a full entry in
+  `indexes`.
+
 ## License
 
 MIT. Copyright (c) 2026 Curlew Labs.

@@ -4,8 +4,10 @@
 // in production instead of by the empty-table heuristic.
 //
 // sqlite_stat1.stat format: "<rows> [<avg_per_distinct_col1>
-// [<avg_per_distinct_(col1,col2)> ...]]". All values >= 1. The planner treats
-// absent and "1" identically.
+// [<avg_per_distinct_(col1,col2)> ...]]", one value per key prefix, all >= 1.
+// A row giving fewer values than the index has columns leaves the rest at
+// whatever estimate SQLite already held; README.md sec."Known issues" says
+// where the default rows this module writes fall short of that format.
 
 import type { PlanDatabase } from "./database";
 

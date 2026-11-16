@@ -567,10 +567,12 @@ export function hasStructurallyBoundedResult(sql: string): boolean {
   );
 }
 
-// `IS`, `IS NULL` and `IS ?` print as an equality in the plan; `IS NOT` does
-// not seek at all.
+// Any IS-family comparison - `IS`, `IS NULL`, `IS ?`, `IS NOT DISTINCT FROM`,
+// the postfix `ISNULL` - can reach a NULL-holding key while printing as an
+// equality in the plan. `IS NOT` and `NOTNULL` match too: reading them as
+// harmless would mean parsing the operator, and a match only keeps the group.
 function usesIsComparison(sql: string): boolean {
-  return /\bIS\b(?!\s+NOT\b)/i.test(sql);
+  return /\b(?:IS|ISNULL|NOTNULL)\b/i.test(sql);
 }
 
 // The key groups one statement's plan seeks, minus every seek already pinned
@@ -628,9 +630,9 @@ export function qKeyGroups(
     // Pinned to at most one row: the index is UNIQUE and every one of its
     // columns carries an equality term, so the constraint names a key rather
     // than a prefix of one - unless a key column admits NULL and the statement
-    // uses an `IS` comparison anywhere, since the plan cannot tell `col IS ?`
-    // from `col = ?`. The `IS` scan reads the raw text, so a match in a comment
-    // keeps the group: that errs toward enrolling it. A UNIQUE index only partly matched (`(a_id=?)` on
+    // uses an IS-family comparison anywhere, since the plan cannot tell
+    // `col IS ?` from `col = ?`. The scan reads the raw text, so a match in a
+    // comment keeps the group: that errs toward enrolling it. A UNIQUE index only partly matched (`(a_id=?)` on
     // UNIQUE(a_id, b_id)) pins a group, not a key, so it stays. `<expr>` is
     // left out: an expression column has no name to count against, which is
     // why the index's named-column count is absent below.

@@ -640,6 +640,19 @@ describe("plan lint", () => {
         ["lint_pairs | lint_uniq_pair | (a_id=? AND b_id=?)"],
       );
       expect(qKeyGroups(equal, equalPlan, ctx(true))).toEqual([]);
+      // Every IS-family spelling reaches a NULL-holding key while printing as
+      // an equality, so each keeps the group.
+      for (const spelling of [
+        "SELECT COUNT(*) FROM lint_pairs WHERE a_id = ? AND b_id ISNULL",
+        "SELECT COUNT(*) FROM lint_pairs WHERE a_id = ? AND b_id IS NOT DISTINCT FROM ?",
+        "SELECT COUNT(*) FROM lint_pairs WHERE a_id = ? AND b_id IS ?",
+      ]) {
+        const plan = await planOf(
+          spelling,
+          ...(spelling.endsWith("?") ? [1, 2] : [1]),
+        );
+        expect(qKeyGroups(spelling, plan, ctx(true)), spelling).toHaveLength(1);
+      }
       expect(qKeyGroups(isNull, isNullPlan, ctx(false))).toEqual([]);
     } finally {
       await env.DB.exec("DROP TABLE lint_pairs");
