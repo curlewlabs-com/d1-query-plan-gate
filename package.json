@@ -1,0 +1,34 @@
+{
+  "name": "d1-query-plan-gate",
+  "version": "0.1.0",
+  "description": "Hold Cloudflare D1 query plans to what a reviewer has read: plan moves per schema delta, a SCAN and unbounded-range plan lint, and production-shape sqlite_stat1 statistics for tests.",
+  "license": "MIT",
+  "author": "Curlew Labs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/curlewlabs-com/d1-query-plan-gate.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p test/tsconfig.json",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.11",
+    "@cloudflare/workers-types": "5.20261025.1",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5",
+    "wrangler": "4.152.0"
+  }
+}
