@@ -149,8 +149,48 @@ function resolvePlanTables(
 // MATCH grants an exemption: `GROUP BY` inside a literal must not take an
 // aggregate out of the key groups. Checks whose match adds a finding read the
 // raw text instead, since stripping there could only remove one.
+//
+// One pass of SQLite's lexer for the classes involved: '...' with '' inside,
+// -- to the end of the line, /* ... */. Each literal or comment becomes one
+// space. An unterminated literal or block comment runs to the end of the
+// text, as SQLite's tokenizer reads it - and a pattern that looked for its
+// close from every later start instead would take time quadratic in the
+// text's length.
 function withoutLiteralsAndComments(sql: string): string {
-  return sql.replace(/'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//g, " ");
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i]!;
+    let end = -1;
+    if (c === "'") {
+      let j = i + 1;
+      end = sql.length;
+      while (j < sql.length) {
+        const quote = sql.indexOf("'", j);
+        if (quote < 0) break;
+        if (sql[quote + 1] === "'") {
+          j = quote + 2;
+        } else {
+          end = quote + 1;
+          break;
+        }
+      }
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const newline = sql.indexOf("\n", i + 2);
+      end = newline < 0 ? sql.length : newline;
+    } else if (c === "/" && sql[i + 1] === "*") {
+      const close = sql.indexOf("*/", i + 2);
+      end = close < 0 ? sql.length : close + 2;
+    }
+    if (end < 0) {
+      out += c;
+      i += 1;
+    } else {
+      out += " ";
+      i = end;
+    }
+  }
+  return out;
 }
 
 // SQLite marks a table it reaches as an EXISTS semi-join between the alias and
@@ -194,14 +234,72 @@ export interface SearchRow {
 // the paren, term by term: a term the range rule cannot read would otherwise
 // leave its range unseen, so `<expr><?` would pass as no range at all. The
 // paren nests exactly one construct, a skip-scan's `ANY(col)`.
-const SEARCH_SEEK_RE =
-  /^SEARCH\s+(\w+)\s+USING\s+(.+?)\s*\(((?:[^()]|\(\w+\))*)\)(?:\s+LEFT-JOIN)?$/;
+//
+// Read in linear time: the head by an anchored pattern, then the constraint
+// paren by one backward scan from its closing `)` - a `)` inside must close a
+// `(word)` group, and the first bare `(` is the paren's opening, the only one
+// a shorter method could leave. A pattern that tried every split of the
+// method from the paren instead takes time quadratic in a run of spaces.
+const SEARCH_SEEK_HEAD_RE = /^SEARCH\s+(\w+)\s+USING\s+/;
+const WORD_CHAR_RE = /\w/;
+const LEFT_JOIN_SUFFIX = "LEFT-JOIN";
+
+function parseSearchSeek(
+  normalized: string,
+): { target: string; method: string; constraint: string } | undefined {
+  const head = SEARCH_SEEK_HEAD_RE.exec(normalized);
+  if (!head) return undefined;
+  let rest = normalized.slice(head[0].length);
+  if (rest.endsWith(LEFT_JOIN_SUFFIX)) {
+    const before = rest.slice(0, -LEFT_JOIN_SUFFIX.length);
+    const trimmed = before.trimEnd();
+    if (trimmed.length < before.length) rest = trimmed;
+  }
+  if (!rest.endsWith(")")) return undefined;
+  let open = -1;
+  let i = rest.length - 2;
+  while (i >= 0) {
+    const c = rest[i]!;
+    if (c === ")") {
+      let j = i - 1;
+      while (j >= 0 && WORD_CHAR_RE.test(rest[j]!)) j -= 1;
+      if (j === i - 1 || j < 0 || rest[j] !== "(") return undefined;
+      i = j - 1;
+    } else if (c === "(") {
+      open = i;
+      break;
+    } else {
+      i -= 1;
+    }
+  }
+  if (open < 1) return undefined;
+  const method = rest.slice(0, open).trim();
+  if (method === "") return undefined;
+  return {
+    target: head[1]!,
+    method,
+    constraint: rest.slice(open + 1, rest.length - 1),
+  };
+}
 const CONSTRAINT_TERM_RE = /^(\w+|<expr>)(<=|>=|<|>|=)\?$/;
 const SKIP_SCAN_TERM_RE = /^ANY\((\w+)\)$/;
 
 function constraintTerms(constraint: string, detail: string): ConstraintTerm[] {
-  return constraint.split(/\s+AND\s+/).map((raw) => {
-    const term = raw.trim();
+  // Split on whitespace once and group the words between ANDs, rather than
+  // splitting on `\s+AND\s+`, which rescans a long run of spaces from every
+  // start.
+  const raws: string[] = [];
+  let current: string[] = [];
+  for (const word of constraint.trim().split(/\s+/)) {
+    if (word === "AND") {
+      raws.push(current.join(" "));
+      current = [];
+    } else {
+      current.push(word);
+    }
+  }
+  raws.push(current.join(" "));
+  return raws.map((term) => {
     const comparison = CONSTRAINT_TERM_RE.exec(term);
     if (comparison) {
       return {
@@ -240,14 +338,9 @@ export function planVirtualTableSources(plan: readonly PlanRow[]): string[] {
 export function parseSearchRow(detail: string): SearchRow | undefined {
   const normalized = planAccessDetail(detail);
   if (!/^SEARCH\b/.test(normalized)) return undefined;
-  const seek = SEARCH_SEEK_RE.exec(normalized);
+  const seek = parseSearchSeek(normalized);
   if (seek) {
-    return {
-      target: seek[1]!,
-      method: seek[2]!.trim(),
-      constraint: seek[3]!,
-      terms: constraintTerms(seek[3]!, detail),
-    };
+    return { ...seek, terms: constraintTerms(seek.constraint, detail) };
   }
   const virtual = SEARCH_VIRTUAL_TABLE_RE.exec(normalized);
   if (virtual) {

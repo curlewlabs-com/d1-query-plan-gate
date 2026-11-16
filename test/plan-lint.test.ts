@@ -658,4 +658,28 @@ describe("plan lint", () => {
       await env.DB.exec("DROP TABLE lint_pairs");
     }
   });
+
+  // Code scanning's polynomial-ReDoS shapes, one per reader: an unterminated
+  // block comment repeated, a constraint paren holding a long run of spaces,
+  // and a SEARCH head followed by one. Each reader must give on these the
+  // answer a short input would. The patterns these replaced took time
+  // quadratic (the comment) and cubic (the SEARCH head) in such a run, but no
+  // test here can fail on time: workerd's clock does not advance during
+  // synchronous code, and a synchronous reader cannot be interrupted. A
+  // backtracking pattern coming back is code scanning's to catch - its CodeQL
+  // check is required on this repository, and raised these alerts.
+  it("reads the input shapes code scanning flagged", () => {
+    expect(
+      hasStructurallyBoundedResult(
+        "SELECT COUNT(*) FROM t /*" + "a/*".repeat(50_000),
+      ),
+    ).toBe(true);
+    expect(
+      parseSearchRow("SEARCH a USING INDEX i (a=?" + " ".repeat(50_000) + ")")
+        ?.terms,
+    ).toEqual([{ column: "a", op: "=" }]);
+    expect(() =>
+      parseSearchRow("SEARCH a USING " + "  ".repeat(50_000)),
+    ).toThrow("cannot read the SEARCH row");
+  });
 });
