@@ -57,7 +57,7 @@ Install it from the GitHub release tarball (it is not published to npm), with
 an exact pin:
 
 ```sh
-bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.1.0/d1-query-plan-gate-0.1.0.tgz
+bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.2.0/d1-query-plan-gate-0.2.0.tgz
 ```
 
 The package ships TypeScript sources; Vitest, Wrangler and Bun compile them.
@@ -87,10 +87,14 @@ import { MODEL } from "../schema/stats-model";
 await applyProductionStats(env.DB, MODEL);
 ```
 
-Every user table must appear in `tables` (or in `excludedTables`, with a
-reason): a table the model does not know throws, rather than planning at the
-default heuristic while the rest of the suite claims production shape. An index
-absent from `indexes` gets `"<table rows> 1"`.
+Every user table must appear in `tables`: a table the model does not know
+throws, rather than planning at the default heuristic while the rest of the
+suite claims production shape. An index absent from `indexes` gets
+`"<table rows> 1"`. A WITHOUT ROWID table's primary key is an index too, which
+SQLite records under the table's own name, so `indexes` keys it by the table
+name; `applyProductionStats` finds it from `pragma_table_list`, and a caller
+enumerating indexes itself for `buildSqliteStat1Rows` passes it as
+`{ name: table, tbl_name: table }`.
 
 For the live database, render the same rows as a payload and apply it at
 deploy time (`wrangler d1 execute --file`):
@@ -166,11 +170,8 @@ the foreign-key probes SQLite plans for a parent-table write are not findings.
 The range rule skips `DELETE` and `UPDATE`: a retention sweep seeks the old end
 of a table on purpose.
 
-A statement's `bindCount` parameters are bound with a placeholder, which is
-right for most plans but not all: `name GLOB ?` seeks an index for `"x*"` and
-scans for `"*x"`. Give a statement whose plan depends on its values
-`binds: [...]` with what production binds, or one named entry per variant.
-Names must be unique; a sweep refuses a repeated one.
+A statement's `bindCount` parameters are bound with a placeholder (see
+Limits). Names must be unique; a sweep refuses a repeated one.
 
 The parser reads the plan-row shapes D1 prints and **throws** on any SEARCH row
 or constraint term it does not recognize, because a skipped row would read as
@@ -246,15 +247,43 @@ any differently.
 - Tested on D1 in the Workers test runtime only. Any database object with the
   same `prepare`/`bind`/`all`/`run`/`batch` shape will run, but plan text and
   error messages are D1's, and nothing else is tested.
-- **Supported SQL for the lint.** It is written for the SQL a query builder
-  emits: tables named after `FROM`, `JOIN`, `INTO` or `UPDATE` (bare or
-  quoted, with an alias), explicit `JOIN` syntax, names spelled with the case
-  the schema uses, and table and index names of word characters. Which tables
-  a statement names is read from its text, not parsed, and a table it does not
-  resolve has its plan rows skipped. So outside that scope it can miss a
-  finding. It reads the raw text, so a table named only in a comment or a string
-  literal counts as named. Known issues lists the gaps, including a comment
-  that re-points an alias.
+- **The lint reads table bindings from the SQL text, not from SQLite.** It
+  matches the statement's text to learn which tables a plan row is about, and
+  it reads these shapes correctly:
+  - a table named directly after `FROM`, `JOIN`, `INTO` or `UPDATE`, bare or
+    quoted (`"t"`, `` `t` ``, `[t]`), spelled as the schema spells it;
+  - an alias written right after such a table in a `FROM` or `JOIN` source,
+    with or without `AS`, used once in the statement;
+  - plan rows that name such a table or alias, or a subquery or CTE source;
+  - table and index names of word characters (`[A-Za-z0-9_]`).
+
+  Outside those shapes a plan row can be skipped or attributed to the wrong
+  table, and either can hide a finding. That includes, at least: the second
+  and later tables of a comma-separated `FROM` list; a parenthesized table
+  (`FROM (t) x`); a name in a different case, schema-qualified (`main.t`) or
+  single-quoted (`'t'`); an alias reused for different tables in different
+  scopes, or one that is a keyword SQLite allows as a name; `FROM`/`JOIN` text
+  inside a comment or string literal, which is read as SQL; and an index name
+  with other characters, which the SCAN rule reads as its leading word
+  characters. A `GROUP BY` inside a subquery, or inside a literal or comment,
+  takes the whole statement out of the key groups. Keep the SQL you lint in
+  the shapes above - a query builder's output usually is - or check that the
+  plan rows you rely on resolve to the right tables.
+
+- **Mutations are outside the range rule, subqueries included.** A retention
+  sweep seeks the old end of its table on purpose, as often through a subquery
+  (`DELETE ... WHERE id IN (SELECT id ... WHERE ts < ? LIMIT n)`) as directly,
+  so the rule skips every statement starting with `DELETE` or `UPDATE`. An
+  unbounded read inside a mutation needs a measured rows-read budget instead.
+- **Plans are measured with placeholder binds.** A value can change the plan:
+  `name GLOB ?` seeks an index for `"x*"` and scans for `"*x"`, and the
+  placeholder plans it as the seek. A statement whose plan depends on its
+  values is checked by a test of its own, with those values.
+- **One statistics payload is for one schema.** SQLite reads a `sqlite_stat1`
+  row naming an index the schema lacks as the table's row count, so
+  `renderStatsSql` output applied to a different schema - the predecessor side
+  of a plan-delta sweep - can set a table's count from a new index's stat. The
+  recipe under "How to use it" builds each side against its own schema.
 - `sqlite_stat4` is not available on D1, so range-distribution-aware choices
   are out of reach; the planner works from `sqlite_stat1` row counts.
 - The lint reads what the plan prints. A residual filter on a column outside
@@ -268,30 +297,11 @@ any differently.
 These are in the code as it was extracted, and are tracked as issues on this
 repository.
 
-- **Table resolution is lexical** (see Limits). A table or alias named inside a
-  comment is read as if it were SQL, so `FROM events e /* JOIN big e */` maps
-  `e` to `big`, and a partial-index exemption can then be judged against the
-  wrong table's row count. A `GROUP BY` inside a subquery takes the whole
-  statement out of the key groups, even when the outer aggregate has none.
-- **More of the lexical reading.** A comma join (`FROM a, b`) resolves only
-  `a`, and a name spelled in a different case from the schema's is not
-  resolved. The range rule skips every statement that starts with `DELETE` or
-  `UPDATE`, including the reads in its subqueries. The SCAN rule reads an
-  index name as its leading word characters, so a quoted name like
-  `"idx-wide"` is read as `idx`, and takes that index's exemption if it is a
-  bounded partial.
 - **A table whose only indexes are partial gets no table-level row.**
   `buildSqliteStat1Rows` writes the table-level (`idx` NULL) row only for a
   table with no index at all, and SQLite takes a table's row count from a
   non-partial index's row, so such a table plans at SQLite's default
   estimate.
-- **A shared statistics payload can misread an index the predecessor lacks.**
-  SQLite reads a `sqlite_stat1` row naming an index it does not have as the
-  table's row count, so on the predecessor side of a plan-delta sweep a new
-  partial index's stat can set its table's count. The recipe under "How to
-  use it" avoids this; `renderStatsSql` output is for one schema.
-- **WITHOUT ROWID primary keys get no row.** Their primary-key index has no
-  `sqlite_master` entry, so it is neither discovered nor accepted in `indexes`.
 - **The default stat for a composite index is `"<rows> 1"`.** It gives no
   estimate for the longer key prefixes, which keep whatever SQLite held
   before. Give a composite index whose plans matter a full entry in

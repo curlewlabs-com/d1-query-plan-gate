@@ -94,27 +94,6 @@ describe("buildSqliteStat1Rows", () => {
         indexes,
       ),
     ).toThrow("indexes not present in the schema: idx_gone");
-    expect(() =>
-      buildSqliteStat1Rows(
-        { tables: { a: 1 }, excludedTables: { gone: "retired" } },
-        ["a"],
-        indexes,
-      ),
-    ).toThrow("excludes tables not present in the schema: gone");
-    expect(() =>
-      buildSqliteStat1Rows(
-        { tables: {}, excludedTables: { a: "reason" } },
-        ["a"],
-        indexes,
-      ),
-    ).toThrow("excludes indexed tables from sqlite_stat1: a.idx_a_x");
-    expect(
-      buildSqliteStat1Rows(
-        { tables: { a: 1 }, excludedTables: { b: "reason" } },
-        ["a", "b"],
-        [],
-      ),
-    ).toEqual([{ tbl: "a", idx: null, stat: "1" }]);
   });
 });
 
@@ -217,7 +196,7 @@ describe("applyProductionStats", () => {
 
   // sqlite_stat1 has no key, so on populated tables the ANALYZE that creates
   // it leaves rows an INSERT OR REPLACE does not replace. The seed must leave
-  // exactly the model's rows, however often it runs, excluded tables included.
+  // exactly the model's rows, however often it runs.
   it("leaves exactly the model's rows on populated tables", async () => {
     await applySchema();
     await env.DB.batch([
@@ -234,7 +213,7 @@ describe("applyProductionStats", () => {
     ]);
     const model: CardinalityModel = {
       ...MODEL,
-      excludedTables: { stats_log: "append-only log nothing plans against" },
+      tables: { ...MODEL.tables, stats_log: 10 },
     };
 
     await applyProductionStats(env.DB, model);
@@ -252,6 +231,7 @@ describe("applyProductionStats", () => {
           stat: "1000000 10 1",
         },
         { tbl: "stats_meta", idx: null, stat: "1" },
+        { tbl: "stats_log", idx: null, stat: "10" },
       ]),
     );
     await env.DB.exec("DROP TABLE stats_log");
@@ -272,6 +252,35 @@ describe("applyProductionStats", () => {
     } finally {
       await env.DB.exec("DROP TABLE acf_events");
       await env.DB.exec("DROP TABLE d1logs");
+    }
+  });
+
+  // A WITHOUT ROWID table's primary key is an index with no sqlite_master
+  // row, which SQLite's sqlite_stat1 records under the table's own name;
+  // missed, its key statistics were absent while the model claimed the table.
+  it("seeds a WITHOUT ROWID table's primary key under the table's name", async () => {
+    await applySchema();
+    await env.DB.exec(
+      "CREATE TABLE stats_pairs (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b)) WITHOUT ROWID",
+    );
+    try {
+      const tables = { ...MODEL.tables, stats_pairs: 5000 };
+      await applyProductionStats(env.DB, { ...MODEL, tables });
+      expect(
+        (await liveStat1()).filter((row) => row.tbl === "stats_pairs"),
+      ).toEqual([{ tbl: "stats_pairs", idx: "stats_pairs", stat: "5000 1" }]);
+
+      await applyProductionStats(env.DB, {
+        tables,
+        indexes: { ...MODEL.indexes, stats_pairs: "5000 50 1" },
+      });
+      expect(
+        (await liveStat1()).filter((row) => row.tbl === "stats_pairs"),
+      ).toEqual([
+        { tbl: "stats_pairs", idx: "stats_pairs", stat: "5000 50 1" },
+      ]);
+    } finally {
+      await env.DB.exec("DROP TABLE stats_pairs");
     }
   });
 });

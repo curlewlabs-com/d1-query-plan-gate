@@ -26,15 +26,13 @@ export interface PlanRow {
 
 // A statement to plan. EXPLAIN QUERY PLAN must prepare it, and D1 refuses a
 // statement with unbound parameters, so its `bindCount` positional `?`
-// parameters are bound with a placeholder value - unless `binds` supplies the
-// values. A value CAN change the plan: SQLite's LIKE/GLOB optimization seeks an
-// index for `name GLOB ?` bound to "x*" and scans for "*x", and the placeholder
-// plans it as the seek. Give a statement whose plan depends on its values the
-// representative values production binds, or one named entry per variant.
+// parameters are bound with a placeholder value. A value can change the plan -
+// SQLite seeks an index for `name GLOB ?` bound to "x*" and scans for "*x" -
+// and the placeholder plans such a statement as the seek; README.md sec.
+// "Limits" says so.
 export interface PlanQuery {
   readonly sql: string;
   readonly bindCount?: number;
-  readonly binds?: readonly unknown[];
 }
 
 export type NamedQuery = readonly [name: string, query: PlanQuery];
@@ -56,15 +54,12 @@ let explainSequence = 0;
 // explainStatement is this prepared on a PlanDatabase.
 export function explainSql(query: PlanQuery): {
   sql: string;
-  binds: unknown[];
+  binds: string[];
 } {
   explainSequence += 1;
   return {
     sql: `EXPLAIN QUERY PLAN /* plan ${explainSequence} */ ${query.sql}`,
-    binds:
-      query.binds !== undefined
-        ? [...query.binds]
-        : Array.from({ length: query.bindCount ?? 0 }, () => PLACEHOLDER_BIND),
+    binds: Array.from({ length: query.bindCount ?? 0 }, () => PLACEHOLDER_BIND),
   };
 }
 
