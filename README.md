@@ -57,7 +57,7 @@ Install it from the GitHub release tarball (it is not published to npm), with
 an exact pin:
 
 ```sh
-bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.3.0/d1-query-plan-gate-0.3.0.tgz
+bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.3.1/d1-query-plan-gate-0.3.1.tgz
 ```
 
 The package ships TypeScript sources; Vitest, Wrangler and Bun compile them.
