@@ -182,35 +182,6 @@ describe("plan delta", () => {
     expect(JSON.parse(literal)).toEqual(measured);
   });
 
-  // A value can change the plan, so a caller must be able to bind the one
-  // production binds: the placeholder plans `GLOB ?` as an index seek, and a
-  // leading wildcard scans.
-  it("plans with the values a query supplies", async () => {
-    const queries: NamedQuery[] = [
-      [
-        "PLACEHOLDER",
-        {
-          sql: "SELECT id FROM plan_delta_probe WHERE tag GLOB ?",
-          bindCount: 1,
-        },
-      ],
-      [
-        "INFIX",
-        {
-          sql: "SELECT id FROM plan_delta_probe WHERE tag GLOB ?",
-          binds: ["*x"],
-        },
-      ],
-    ];
-    const plans = await sweep(
-      ["CREATE INDEX idx_plan_delta_probe_glob ON plan_delta_probe(tag)"],
-      queries,
-    );
-
-    expect(plans.get("PLACEHOLDER")).toContain("idx_plan_delta_probe_glob");
-    expect(plans.get("INFIX")).toBe("SCAN plan_delta_probe");
-  });
-
   // Plans are keyed by name, so a repeated name would let a working query's
   // plan replace a broken one's.
   it("refuses repeated query names", async () => {

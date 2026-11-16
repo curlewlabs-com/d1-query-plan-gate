@@ -13,22 +13,21 @@ import type { PlanDatabase } from "./database";
 
 export interface CardinalityModel {
   // Modeled row count per table. Every user table the schema holds must be
-  // here or in `excludedTables`; a table missing from both throws, because it
-  // would sit at the planner's default-large heuristic while everything else
-  // claims to run under production-shape statistics.
+  // here; a table missing throws, because it would sit at the planner's
+  // default-large heuristic while everything else claims to run under
+  // production-shape statistics.
   readonly tables: Readonly<Record<string, number>>;
   // Full stat strings for the indexes whose default would mislead the
   // planner. An index absent here gets "<table rows> 1": each key value
   // assumed unique.
   readonly indexes?: Readonly<Record<string, string>>;
-  // Tables deliberately left without a sqlite_stat1 row, each with the reason.
-  // An excluded table may carry no index, since the planner would read that
-  // index at the default heuristic.
-  readonly excludedTables?: Readonly<Record<string, string>>;
 }
 
-// One sqlite_master index row, as `SELECT name, tbl_name FROM sqlite_master
-// WHERE type='index'` returns it.
+// One index the schema holds: a sqlite_master index row, as `SELECT name,
+// tbl_name FROM sqlite_master WHERE type='index'` returns it - or, for a
+// WITHOUT ROWID table, its primary-key index, which has no sqlite_master row
+// and which sqlite_stat1 records under the table's own name, so `name` is the
+// table name. The model's `indexes` keys such an entry by the table name too.
 export interface SchemaIndexRow {
   name: string;
   tbl_name: string;
@@ -42,8 +41,8 @@ export interface SqliteStat1Row {
 
 // The sqlite_stat1 rows a schema should carry under `model`, given the
 // schema's user tables and indexes. Throws when the model and the schema
-// disagree: a table unmodeled, an index or an exclusion naming something the
-// schema lacks, an excluded table with an index.
+// disagree: a table the model does not count, or an index entry the schema
+// lacks.
 export function buildSqliteStat1Rows(
   model: CardinalityModel,
   schemaTableNames: readonly string[],
@@ -51,30 +50,9 @@ export function buildSqliteStat1Rows(
 ): SqliteStat1Row[] {
   const tableRows = model.tables;
   const indexStats = model.indexes ?? {};
-  const excluded = model.excludedTables ?? {};
   const modeledTables = new Set(Object.keys(tableRows));
-  const statExcludedTables = new Set(Object.keys(excluded));
-  const staleExcludedTables = Object.keys(excluded).filter(
-    (name) => !schemaTableNames.includes(name),
-  );
-  if (staleExcludedTables.length > 0) {
-    throw new Error(
-      `cardinality model excludes tables not present in the schema: ${staleExcludedTables.join(", ")}`,
-    );
-  }
 
-  const indexedExcludedTables = schemaIndexes
-    .filter((row) => statExcludedTables.has(row.tbl_name))
-    .map((row) => `${row.tbl_name}.${row.name}`);
-  if (indexedExcludedTables.length > 0) {
-    throw new Error(
-      `cardinality model excludes indexed tables from sqlite_stat1: ${indexedExcludedTables.join(", ")}`,
-    );
-  }
-
-  const unmodeled = schemaTableNames.filter(
-    (name) => !modeledTables.has(name) && !statExcludedTables.has(name),
-  );
+  const unmodeled = schemaTableNames.filter((name) => !modeledTables.has(name));
   if (unmodeled.length > 0) {
     throw new Error(
       `cardinality model is missing table row counts for: ${unmodeled.join(", ")}`,
@@ -111,7 +89,6 @@ export function buildSqliteStat1Rows(
   // to its default-large heuristic for it.
   const tablesWithIndexes = new Set(schemaIndexes.map((row) => row.tbl_name));
   for (const name of schemaTableNames) {
-    if (statExcludedTables.has(name)) continue;
     if (tablesWithIndexes.has(name)) continue;
     rows.push({ tbl: name, idx: null, stat: String(rowsOf(name)) });
   }
@@ -208,12 +185,27 @@ export async function applyProductionStats(
     )
     .bind(...tableNames)
     .all<SchemaIndexRow>();
+  // pragma_table_list's `wr` marks a WITHOUT ROWID table, whose primary key is
+  // an index with no sqlite_master row; without it the key's statistics would
+  // be missing while the model claimed the table.
+  const withoutRowid = await db
+    .prepare(
+      "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND wr = 1",
+    )
+    .all<NameRow>();
+  const modeled = new Set(tableNames);
+  const primaryKeys = withoutRowid.results
+    .filter((row) => modeled.has(row.name))
+    .map((row) => ({ name: row.name, tbl_name: row.name }));
 
-  const rows = buildSqliteStat1Rows(model, tableNames, enumerated.results);
+  const rows = buildSqliteStat1Rows(model, tableNames, [
+    ...enumerated.results,
+    ...primaryKeys,
+  ]);
   // sqlite_stat1 has no key, so INSERT OR REPLACE replaces nothing: the rows
-  // the ANALYZE above wrote for populated tables would stay beside the model's,
-  // and an excluded table would keep its analyzed row. Clearing first, in the
-  // same batch, leaves exactly the model's rows, as the rendered payload does.
+  // the ANALYZE above wrote for populated tables would stay beside the model's.
+  // Clearing first, in the same batch, leaves exactly the model's rows, as the
+  // rendered payload does.
   const inserts = rows.map((row) =>
     db
       .prepare(

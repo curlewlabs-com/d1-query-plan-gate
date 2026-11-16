@@ -210,10 +210,9 @@ export function acknowledgementDrift(
 
 export interface PlanMovesModuleOptions {
   // Everything above the export line, verbatim: a header comment saying how to
-  // regenerate the file, and the import of the PlanMove type.
+  // regenerate the file, and an import that brings the `PlanMove` type into
+  // scope under that name. The table is exported as `PLAN_MOVES`.
   readonly preamble: string;
-  readonly exportName?: string;
-  readonly typeName?: string;
 }
 
 // The whole generated module, so a comparison against the committed file is
@@ -223,10 +222,8 @@ export function renderPlanMovesModule(
   measured: Readonly<Record<string, PlanMove>>,
   options: PlanMovesModuleOptions,
 ): string {
-  const exportName = options.exportName ?? "PLAN_MOVES";
-  const typeName = options.typeName ?? "PlanMove";
   return `${options.preamble}
-export const ${exportName}: Readonly<Record<string, ${typeName}>> = ${JSON.stringify(measured, null, 2)};
+export const PLAN_MOVES: Readonly<Record<string, PlanMove>> = ${JSON.stringify(measured, null, 2)};
 `;
 }
 
