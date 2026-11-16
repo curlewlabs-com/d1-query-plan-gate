@@ -88,35 +88,69 @@ const POST_TABLE_KEYWORDS = new Set([
   "VALUES",
 ]);
 
+// One identifier as SQLite's lexer accepts it: bare, or quoted with "", ``
+// or [] (a doubled quote inside is a literal quote).
+const IDENTIFIER = String.raw`(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|\[[^\]]+\]|[a-z_]\w*)`;
+
+function unquoteIdentifier(token: string): string {
+  const open = token[0];
+  if (open === '"') return token.slice(1, -1).replace(/""/g, '"');
+  if (open === "`") return token.slice(1, -1).replace(/``/g, "`");
+  if (open === "[") return token.slice(1, -1);
+  return token;
+}
+
 // Resolve, from a statement's SQL text, the user tables it names (after
 // FROM/JOIN/INTO/UPDATE) and its alias->table map. Shared by the SCAN engine,
 // the range-SEARCH engine and the key groups so they read aliases identically -
 // a divergence between the parsers would let an aliased plan row slip past one
 // rule but not the other.
+//
+// This is a lexical reading, and what it misses is an ALLOW: a table it does
+// not resolve has its plan rows skipped. So it reads every identifier form
+// SQLite's lexer accepts, and it reads the raw text - a table named only
+// inside a comment or a string literal counts too, which can only add a
+// finding. A schema-qualified name (`main.events`) is not resolved.
 function resolvePlanTables(
   sql: string,
   userTableNames: ReadonlySet<string>,
 ): { primaryTables: Set<string>; aliasToTable: Map<string, string> } {
-  const tableRefRe = /\b(?:FROM|JOIN|INTO|UPDATE)\s+([a-z_]\w*)/gi;
-  const aliasRe =
-    /\b(?:FROM|JOIN)\s+([a-z_]\w*)(?:\s+(?:AS\s+)?([a-z_]\w*))?/gi;
+  const tableRefRe = new RegExp(
+    String.raw`\b(?:FROM|JOIN|INTO|UPDATE)\s+(${IDENTIFIER})`,
+    "gi",
+  );
+  const aliasRe = new RegExp(
+    String.raw`\b(?:FROM|JOIN)\s+(${IDENTIFIER})(?:\s+(?:AS\s+)?(${IDENTIFIER}))?`,
+    "gi",
+  );
   const primaryTables = new Set<string>();
   const aliasToTable = new Map<string, string>();
   let mm: RegExpExecArray | null;
   while ((mm = tableRefRe.exec(sql)) !== null) {
-    const candidate = mm[1]!;
+    const candidate = unquoteIdentifier(mm[1]!);
     if (userTableNames.has(candidate)) primaryTables.add(candidate);
   }
   let am: RegExpExecArray | null;
   while ((am = aliasRe.exec(sql)) !== null) {
-    const tbl = am[1]!;
+    const tbl = unquoteIdentifier(am[1]!);
     if (!userTableNames.has(tbl)) continue;
-    const alias = am[2];
-    if (!alias) continue;
-    if (POST_TABLE_KEYWORDS.has(alias.toUpperCase())) continue;
+    const aliasToken = am[2];
+    if (!aliasToken) continue;
+    const alias = unquoteIdentifier(aliasToken);
+    if (aliasToken === alias && POST_TABLE_KEYWORDS.has(alias.toUpperCase())) {
+      continue;
+    }
     aliasToTable.set(alias, tbl);
   }
   return { primaryTables, aliasToTable };
+}
+
+// The SQL with its string literals and comments blanked, for a check whose
+// MATCH grants an exemption: `GROUP BY` inside a literal must not take an
+// aggregate out of the key groups. Checks whose match adds a finding read the
+// raw text instead, since stripping there could only remove one.
+function withoutLiteralsAndComments(sql: string): string {
+  return sql.replace(/'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//g, " ");
 }
 
 // SQLite marks a table it reaches as an EXISTS semi-join between the alias and
@@ -482,6 +516,11 @@ export interface KeyGroupContext {
   // Partial-index predicates by index name, normalized to single spaces. Absent
   // for a full index.
   partialIndexPredicates: ReadonlyMap<string, string>;
+  // UNIQUE indexes with a key column that admits NULL. SQLite's UNIQUE lets
+  // any number of rows share a key holding a NULL, and the plan prints an
+  // `IS NULL` (or `IS ?`) term exactly like an equality, `col=?`, so a fully
+  // matched key on one of these can be a group, not a row.
+  nullableKeyIndexNames: ReadonlySet<string>;
   // Named columns per index. An index carrying an EXPRESSION column is absent
   // here: pragma_index_info reports a NULL name for one, so its column set
   // cannot be matched against the constraint's terms and the pinned test below
@@ -524,8 +563,14 @@ export function hasStructurallyBoundedResult(sql: string): boolean {
   if (!isMutation && /\bLIMIT\s+\d+\b/i.test(sql)) return true;
   return (
     /\b(?:COUNT|MAX|MIN|SUM|TOTAL|AVG)\s*\(/i.test(sql) &&
-    !/\bGROUP\s+BY\b/i.test(sql)
+    !/\bGROUP\s+BY\b/i.test(withoutLiteralsAndComments(sql))
   );
+}
+
+// `IS`, `IS NULL` and `IS ?` print as an equality in the plan; `IS NOT` does
+// not seek at all.
+function usesIsComparison(sql: string): boolean {
+  return /\bIS\b(?!\s+NOT\b)/i.test(sql);
 }
 
 // The key groups one statement's plan seeks, minus every seek already pinned
@@ -582,7 +627,10 @@ export function qKeyGroups(
     if (!primaryTables.has(realTable)) continue;
     // Pinned to at most one row: the index is UNIQUE and every one of its
     // columns carries an equality term, so the constraint names a key rather
-    // than a prefix of one. A UNIQUE index only partly matched (`(a_id=?)` on
+    // than a prefix of one - unless a key column admits NULL and the statement
+    // uses an `IS` comparison anywhere, since the plan cannot tell `col IS ?`
+    // from `col = ?`. The `IS` scan reads the raw text, so a match in a comment
+    // keeps the group: that errs toward enrolling it. A UNIQUE index only partly matched (`(a_id=?)` on
     // UNIQUE(a_id, b_id)) pins a group, not a key, so it stays. `<expr>` is
     // left out: an expression column has no name to count against, which is
     // why the index's named-column count is absent below.
@@ -590,10 +638,13 @@ export function qKeyGroups(
       (term) => term.op === "=" && term.column !== "<expr>",
     ).length;
     const namedColumns = indexNamedColumnCounts.get(index);
+    const nullSafe =
+      !ctx.nullableKeyIndexNames.has(index) || !usesIsComparison(sql);
     if (
       uniqueIndexNames.has(index) &&
       namedColumns !== undefined &&
-      equalityTerms >= namedColumns
+      equalityTerms >= namedColumns &&
+      nullSafe
     ) {
       continue;
     }

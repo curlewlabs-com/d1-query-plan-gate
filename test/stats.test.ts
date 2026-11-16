@@ -214,4 +214,64 @@ describe("applyProductionStats", () => {
       applyProductionStats(env.DB, { tables: { stats_events: 1 } }),
     ).rejects.toThrow("missing table row counts for: stats_meta");
   });
+
+  // sqlite_stat1 has no key, so on populated tables the ANALYZE that creates
+  // it leaves rows an INSERT OR REPLACE does not replace. The seed must leave
+  // exactly the model's rows, however often it runs, excluded tables included.
+  it("leaves exactly the model's rows on populated tables", async () => {
+    await applySchema();
+    await env.DB.batch([
+      env.DB.prepare("DROP TABLE IF EXISTS stats_log"),
+      env.DB.prepare(
+        "CREATE TABLE stats_log (id INTEGER PRIMARY KEY, line TEXT)",
+      ),
+      ...Array.from({ length: 20 }, (_, i) =>
+        env.DB.prepare(
+          "INSERT INTO stats_events (user_id, kind) VALUES (?, ?)",
+        ).bind(i % 3, i % 2),
+      ),
+      env.DB.prepare("INSERT INTO stats_log (line) VALUES ('x')"),
+    ]);
+    const model: CardinalityModel = {
+      ...MODEL,
+      excludedTables: { stats_log: "append-only log nothing plans against" },
+    };
+
+    await applyProductionStats(env.DB, model);
+    await applyProductionStats(env.DB, model);
+    expect(byKey(await liveStat1())).toEqual(
+      byKey([
+        {
+          tbl: "stats_events",
+          idx: "idx_stats_events_user",
+          stat: "1000000 1000",
+        },
+        {
+          tbl: "stats_events",
+          idx: "idx_stats_events_user_kind",
+          stat: "1000000 10 1",
+        },
+        { tbl: "stats_meta", idx: null, stat: "1" },
+      ]),
+    );
+    await env.DB.exec("DROP TABLE stats_log");
+  });
+
+  // LIKE reads `_` as any one character, so an unescaped `_cf_%` or `d1_%`
+  // filter would drop these ordinary tables from the completeness check.
+  it("checks tables whose names only resemble a reserved prefix", async () => {
+    await applySchema();
+    await env.DB.batch([
+      env.DB.prepare("CREATE TABLE acf_events (id INTEGER PRIMARY KEY)"),
+      env.DB.prepare("CREATE TABLE d1logs (id INTEGER PRIMARY KEY)"),
+    ]);
+    try {
+      await expect(applyProductionStats(env.DB, MODEL)).rejects.toThrow(
+        "missing table row counts for: acf_events, d1logs",
+      );
+    } finally {
+      await env.DB.exec("DROP TABLE acf_events");
+      await env.DB.exec("DROP TABLE d1logs");
+    }
+  });
 });

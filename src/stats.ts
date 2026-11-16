@@ -176,7 +176,7 @@ interface NameRow {
 //      completeness check fails on a table the model does not know.
 //   2. ANALYZE first: sqlite_stat1 is created lazily by the first ANALYZE, and
 //      without it the INSERTs have no table to write into.
-//   3. INSERT OR REPLACE the modeled rows, in one batch.
+//   3. Replace every sqlite_stat1 row with the modeled rows, in one batch.
 //   4. ANALYZE sqlite_master: the reload trigger. Without it the planner keeps
 //      the statistics it loaded before the INSERTs.
 export async function applyProductionStats(
@@ -184,11 +184,15 @@ export async function applyProductionStats(
   model: CardinalityModel,
 ): Promise<void> {
   // sqlite_*, _cf_* and d1_* are SQLite's and D1's own namespaces; no
-  // application table lives there.
+  // application table lives there. The underscores are escaped because LIKE
+  // reads `_` as any one character, which would also drop `acf_events` or
+  // `d1logs` from the completeness check.
   const userTables = await db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type='table' " +
-        "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%'",
+        "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' " +
+        "AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' " +
+        "AND name NOT LIKE 'd1\\_%' ESCAPE '\\'",
     )
     .all<NameRow>();
   const tableNames = userTables.results.map((row) => row.name);
@@ -203,18 +207,19 @@ export async function applyProductionStats(
     .bind(...tableNames)
     .all<SchemaIndexRow>();
 
-  const inserts = buildSqliteStat1Rows(
-    model,
-    tableNames,
-    enumerated.results,
-  ).map((row) =>
+  const rows = buildSqliteStat1Rows(model, tableNames, enumerated.results);
+  // sqlite_stat1 has no key, so INSERT OR REPLACE replaces nothing: the rows
+  // the ANALYZE above wrote for populated tables would stay beside the model's,
+  // and an excluded table would keep its analyzed row. Clearing first, in the
+  // same batch, leaves exactly the model's rows, as the rendered payload does.
+  const inserts = rows.map((row) =>
     db
       .prepare(
         "INSERT OR REPLACE INTO sqlite_stat1 (tbl, idx, stat) VALUES (?, ?, ?)",
       )
       .bind(row.tbl, row.idx, row.stat),
   );
-  await db.batch(inserts);
+  await db.batch([db.prepare("DELETE FROM sqlite_stat1"), ...inserts]);
 
   await db.prepare("ANALYZE sqlite_master").run();
 }

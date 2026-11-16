@@ -23,6 +23,7 @@
 // failure is the gate working - the plan production will run changed.
 
 import {
+  assertUniqueNames,
   explainStatement,
   type NamedQuery,
   type PlanDatabase,
@@ -117,6 +118,7 @@ export async function planSweep(
   db: PlanDatabase,
   queries: readonly NamedQuery[],
 ): Promise<Map<string, string>> {
+  assertUniqueNames(queries);
   const explains = queries.map(([, query]) => explainStatement(db, query));
   let batched: { results: PlanRow[] }[] | null = null;
   try {

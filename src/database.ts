@@ -24,13 +24,17 @@ export interface PlanRow {
   detail: string;
 }
 
-// A statement to plan. `bindCount` positional `?` parameters are bound with a
-// placeholder value, because EXPLAIN QUERY PLAN must prepare the statement and
-// D1 refuses to run one with unbound parameters; the plan does not depend on
-// the value.
+// A statement to plan. EXPLAIN QUERY PLAN must prepare it, and D1 refuses a
+// statement with unbound parameters, so its `bindCount` positional `?`
+// parameters are bound with a placeholder value - unless `binds` supplies the
+// values. A value CAN change the plan: SQLite's LIKE/GLOB optimization seeks an
+// index for `name GLOB ?` bound to "x*" and scans for "*x", and the placeholder
+// plans it as the seek. Give a statement whose plan depends on its values the
+// representative values production binds, or one named entry per variant.
 export interface PlanQuery {
   readonly sql: string;
   readonly bindCount?: number;
+  readonly binds?: readonly unknown[];
 }
 
 export type NamedQuery = readonly [name: string, query: PlanQuery];
@@ -47,28 +51,57 @@ const PLACEHOLDER_BIND = "x";
 // plans.
 let explainSequence = 0;
 
+// The EXPLAIN text and placeholder binds for one query, for a caller that
+// prepares the statement on its own binding (to keep D1's statement type);
+// explainStatement is this prepared on a PlanDatabase.
+export function explainSql(query: PlanQuery): {
+  sql: string;
+  binds: unknown[];
+} {
+  explainSequence += 1;
+  return {
+    sql: `EXPLAIN QUERY PLAN /* plan ${explainSequence} */ ${query.sql}`,
+    binds:
+      query.binds !== undefined
+        ? [...query.binds]
+        : Array.from({ length: query.bindCount ?? 0 }, () => PLACEHOLDER_BIND),
+  };
+}
+
 export function explainStatement(
   db: PlanDatabase,
   query: PlanQuery,
 ): PlanStatement {
-  const binds = Array.from(
-    { length: query.bindCount ?? 0 },
-    () => PLACEHOLDER_BIND,
-  );
-  explainSequence += 1;
-  return db
-    .prepare(`EXPLAIN QUERY PLAN /* plan ${explainSequence} */ ${query.sql}`)
-    .bind(...binds);
+  const { sql, binds } = explainSql(query);
+  return db.prepare(sql).bind(...binds);
 }
 
 // Every query's plan rows in one round trip. Issued one EXPLAIN at a time the
 // walk costs a round trip per query, and on a loaded CI host the round trip,
 // not the planning, is what dominates. A batch runs its statements in order and
 // returns their results in that order, so the plans are the same plans.
+// Plans are keyed by name, so a second query under a name already taken would
+// replace the first one's plan - and hide a broken query, or its move, behind
+// a working one. Every sweep refuses that up front.
+export function assertUniqueNames(queries: readonly NamedQuery[]): void {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const [name] of queries) {
+    if (seen.has(name)) duplicates.add(name);
+    seen.add(name);
+  }
+  if (duplicates.size > 0) {
+    throw new Error(
+      `d1-query-plan-gate: query names must be unique; repeated: ${[...duplicates].sort().join(", ")}`,
+    );
+  }
+}
+
 export async function explainAll(
   db: PlanDatabase,
   queries: readonly NamedQuery[],
 ): Promise<Map<string, PlanRow[]>> {
+  assertUniqueNames(queries);
   const plans = await db.batch<PlanRow>(
     queries.map(([, query]) => explainStatement(db, query)),
   );

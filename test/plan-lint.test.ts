@@ -270,6 +270,7 @@ describe("plan lint", () => {
       userTableNames: new Set(["pairs", "devices"]),
       uniqueIndexNames: new Set(["uniq_pair", "uniq_expr"]),
       partialIndexPredicates: new Map([["part_live", "status = 1"]]),
+      nullableKeyIndexNames: new Set(),
       // uniq_expr is absent: an expression column reports a NULL name, so its
       // column count is unknowable and the pinned test must not clear it.
       indexNamedColumnCounts: new Map([
@@ -381,6 +382,7 @@ describe("plan lint", () => {
         uniqueIndexNames: new Set(),
         partialIndexPredicates: new Map(),
         indexNamedColumnCounts: new Map([["plain_idx", 1]]),
+        nullableKeyIndexNames: new Set(),
       },
     ).map(keyGroupId);
     expect(groups).toEqual(["events | plain_idx | (user_id=?)"]);
@@ -410,6 +412,7 @@ describe("plan lint", () => {
           uniqueIndexNames: new Set(),
           partialIndexPredicates: new Map(),
           indexNamedColumnCounts: new Map(),
+          nullableKeyIndexNames: new Set(),
         }),
       ).toThrow(row.detail);
     }
@@ -422,6 +425,7 @@ describe("plan lint", () => {
       uniqueIndexNames: new Set<string>(),
       partialIndexPredicates: new Map<string, string>(),
       indexNamedColumnCounts: new Map<string, number>(),
+      nullableKeyIndexNames: new Set<string>(),
     };
     // A WITHOUT ROWID table's PRIMARY KEY may be composite, so a prefix seek on
     // it reaches a group; only the rowid is a classified one-row skip.
@@ -550,5 +554,95 @@ describe("plan lint", () => {
     expect(
       hasStructurallyBoundedResult("UPDATE t SET a = 1 WHERE id = ?"),
     ).toBe(false);
+  });
+
+  // A table named with a quoted identifier resolved to nothing, so its SCAN
+  // was skipped: a miss in table resolution is an exemption, not a no-op.
+  it("SCAN rule resolves quoted table names and aliases", async () => {
+    await env.DB.exec(
+      'CREATE TABLE "lint_quoted" (id INTEGER PRIMARY KEY, name TEXT)',
+    );
+    try {
+      const ctx = {
+        userTableNames: new Set(["lint_quoted"]),
+        partialIndexNames: new Set<string>(),
+        modeledIndexRows: new Map<string, number>(),
+        parentRowCounts: new Map<string, number>(),
+      };
+      for (const sql of [
+        'SELECT q.id FROM "lint_quoted" q WHERE q.name = ?',
+        "SELECT [q].id FROM [lint_quoted] AS [q] WHERE [q].name = ?",
+        "SELECT id FROM `lint_quoted` WHERE name = ?",
+      ]) {
+        const findings = qScanFindings(
+          "QUOTED",
+          sql,
+          await planOf(sql, "x"),
+          ctx,
+        );
+        expect(
+          findings.map((f) => [f.rule, f.table]),
+          sql,
+        ).toEqual([["no-scan-on-user-tables", "lint_quoted"]]);
+      }
+    } finally {
+      await env.DB.exec('DROP TABLE "lint_quoted"');
+    }
+  });
+
+  // `GROUP BY` is an exemption from the key groups, so a match must be the
+  // clause itself, never words inside a literal or a comment.
+  it("a GROUP BY inside a literal or comment keeps an aggregate in scope", () => {
+    for (const sql of [
+      "SELECT COUNT(*) FROM t WHERE note = 'GROUP BY'",
+      "SELECT COUNT(*) FROM t -- GROUP BY u\nWHERE u = ?",
+      "SELECT COUNT(*) FROM t /* GROUP BY u */ WHERE u = ?",
+      "SELECT COUNT(*) FROM t WHERE note = 'it''s GROUP BY'",
+    ]) {
+      expect(hasStructurallyBoundedResult(sql), sql).toBe(true);
+    }
+    expect(
+      hasStructurallyBoundedResult(
+        "SELECT u, COUNT(*) FROM t WHERE note = 'x' GROUP BY u",
+      ),
+    ).toBe(false);
+  });
+
+  // SQLite's UNIQUE admits any number of rows sharing a key that holds a NULL,
+  // and D1 prints `b_id IS NULL` as `b_id=?`, so a fully matched nullable key
+  // is pinned only when the statement has no IS comparison.
+  it("a fully matched UNIQUE key with a nullable column is pinned only without IS", async () => {
+    await env.DB.exec(
+      "CREATE TABLE lint_pairs (id INTEGER PRIMARY KEY, a_id INTEGER NOT NULL, b_id INTEGER)",
+    );
+    await env.DB.exec(
+      "CREATE UNIQUE INDEX lint_uniq_pair ON lint_pairs(a_id, b_id)",
+    );
+    try {
+      const ctx = (nullable: boolean): KeyGroupContext => ({
+        userTableNames: new Set(["lint_pairs"]),
+        uniqueIndexNames: new Set(["lint_uniq_pair"]),
+        partialIndexPredicates: new Map(),
+        nullableKeyIndexNames: new Set(nullable ? ["lint_uniq_pair"] : []),
+        indexNamedColumnCounts: new Map([["lint_uniq_pair", 2]]),
+      });
+      const isNull =
+        "SELECT COUNT(*) FROM lint_pairs WHERE a_id = ? AND b_id IS NULL";
+      const equal =
+        "SELECT COUNT(*) FROM lint_pairs WHERE a_id = ? AND b_id = ?";
+      const isNullPlan = await planOf(isNull, 1);
+      const equalPlan = await planOf(equal, 1, 2);
+      expect(isNullPlan.map((r) => r.detail)).toEqual(
+        equalPlan.map((r) => r.detail),
+      );
+
+      expect(qKeyGroups(isNull, isNullPlan, ctx(true)).map(keyGroupId)).toEqual(
+        ["lint_pairs | lint_uniq_pair | (a_id=? AND b_id=?)"],
+      );
+      expect(qKeyGroups(equal, equalPlan, ctx(true))).toEqual([]);
+      expect(qKeyGroups(isNull, isNullPlan, ctx(false))).toEqual([]);
+    } finally {
+      await env.DB.exec("DROP TABLE lint_pairs");
+    }
   });
 });

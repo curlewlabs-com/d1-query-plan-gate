@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 import {
   UNPLANNABLE,
+  explainAll,
   acknowledgementDrift,
   measuredMoves,
   movedQueries,
@@ -179,5 +180,47 @@ describe("plan delta", () => {
     expect(text.endsWith(";\n")).toBe(true);
     const literal = text.slice(text.indexOf("= ") + 2, -2);
     expect(JSON.parse(literal)).toEqual(measured);
+  });
+
+  // A value can change the plan, so a caller must be able to bind the one
+  // production binds: the placeholder plans `GLOB ?` as an index seek, and a
+  // leading wildcard scans.
+  it("plans with the values a query supplies", async () => {
+    const queries: NamedQuery[] = [
+      [
+        "PLACEHOLDER",
+        {
+          sql: "SELECT id FROM plan_delta_probe WHERE tag GLOB ?",
+          bindCount: 1,
+        },
+      ],
+      [
+        "INFIX",
+        {
+          sql: "SELECT id FROM plan_delta_probe WHERE tag GLOB ?",
+          binds: ["*x"],
+        },
+      ],
+    ];
+    const plans = await sweep(
+      ["CREATE INDEX idx_plan_delta_probe_glob ON plan_delta_probe(tag)"],
+      queries,
+    );
+
+    expect(plans.get("PLACEHOLDER")).toContain("idx_plan_delta_probe_glob");
+    expect(plans.get("INFIX")).toBe("SCAN plan_delta_probe");
+  });
+
+  // Plans are keyed by name, so a repeated name would let a working query's
+  // plan replace a broken one's.
+  it("refuses repeated query names", async () => {
+    const repeated: NamedQuery[] = [
+      ["SAME", { sql: "SELECT missing FROM plan_delta_probe" }],
+      ["SAME", { sql: "SELECT id FROM plan_delta_probe" }],
+    ];
+    await expect(sweep([], repeated)).rejects.toThrow("repeated: SAME");
+    await expect(explainAll(env.DB, repeated)).rejects.toThrow(
+      "repeated: SAME",
+    );
   });
 });

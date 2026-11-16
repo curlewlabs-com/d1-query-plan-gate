@@ -166,6 +166,12 @@ the foreign-key probes SQLite plans for a parent-table write are not findings.
 The range rule skips `DELETE` and `UPDATE`: a retention sweep seeks the old end
 of a table on purpose.
 
+A statement's `bindCount` parameters are bound with a placeholder, which is
+right for most plans but not all: `name GLOB ?` seeks an index for `"x*"` and
+scans for `"*x"`. Give a statement whose plan depends on its values
+`binds: [...]` with what production binds, or one named entry per variant.
+Names must be unique; a sweep refuses a repeated one.
+
 The parser reads the plan-row shapes D1 prints and **throws** on any SEARCH row
 or constraint term it does not recognize, because a skipped row would read as
 "fine". A new shape after a runtime upgrade fails your suite naming the row.
@@ -174,6 +180,10 @@ or constraint term it does not recognize, because a skipped row would read as
 structurally bounded result (a literal `LIMIT`, or an aggregate without
 `GROUP BY`) seeks. A plan cannot say how large a group is, so hold the ids
 against a committed roster in which each entry says why its group is bounded.
+A UNIQUE index whose key is fully matched counts as one row and is left out,
+except an index named in `nullableKeyIndexNames` when the statement uses an
+`IS` comparison: SQLite's UNIQUE admits repeated keys holding a NULL, and the
+plan prints `b_id IS NULL` as `b_id=?`.
 
 ### 3. Plan moves per schema delta
 
@@ -230,6 +240,11 @@ any differently.
 - Tested on D1 in the Workers test runtime only. Any database object with the
   same `prepare`/`bind`/`all`/`run`/`batch` shape will run, but plan text and
   error messages are D1's, and nothing else is tested.
+- Which tables a statement names is read from its text: the identifier after
+  `FROM`, `JOIN`, `INTO` or `UPDATE`, bare or quoted, with its alias. A
+  schema-qualified name (`main.events`) is not resolved, and a plan row naming
+  a table whose name has characters outside `[A-Za-z0-9_]` is only read through
+  an alias. A table the lint does not resolve has its plan rows skipped.
 - `sqlite_stat4` is not available on D1, so range-distribution-aware choices
   are out of reach; the planner works from `sqlite_stat1` row counts.
 - The lint reads what the plan prints. A residual filter on a column outside
