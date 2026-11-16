@@ -63,8 +63,8 @@ async function planFor(sql: string): Promise<string> {
 
 describe("buildSqliteStat1Rows", () => {
   const indexes = [
-    { name: "idx_a_x", tbl_name: "a" },
-    { name: "idx_a_y", tbl_name: "a" },
+    { name: "idx_a_x", tbl_name: "a", columns: 1 },
+    { name: "idx_a_y", tbl_name: "a", columns: 2 },
   ];
 
   it("models every index and gives an unindexed table a table-level row", () => {
@@ -74,9 +74,10 @@ describe("buildSqliteStat1Rows", () => {
       indexes,
     );
     expect(rows).toEqual([
+      { tbl: "a", idx: null, stat: "500" },
+      { tbl: "b", idx: null, stat: "7" },
       { tbl: "a", idx: "idx_a_x", stat: "500 1" },
       { tbl: "a", idx: "idx_a_y", stat: "500 50 1" },
-      { tbl: "b", idx: null, stat: "7" },
     ]);
   });
 
@@ -127,8 +128,16 @@ describe("renderStatsSql", () => {
         MODEL,
         ["stats_events", "stats_meta"],
         [
-          { name: "idx_stats_events_user", tbl_name: "stats_events" },
-          { name: "idx_stats_events_user_kind", tbl_name: "stats_events" },
+          {
+            name: "idx_stats_events_user",
+            tbl_name: "stats_events",
+            columns: 1,
+          },
+          {
+            name: "idx_stats_events_user_kind",
+            tbl_name: "stats_events",
+            columns: 2,
+          },
         ],
       ),
     ];
@@ -180,6 +189,7 @@ describe("applyProductionStats", () => {
           idx: "idx_stats_events_user_kind",
           stat: "1000000 10 1",
         },
+        { tbl: "stats_events", idx: null, stat: "1000000" },
         { tbl: "stats_meta", idx: null, stat: "1" },
       ]),
     );
@@ -230,6 +240,7 @@ describe("applyProductionStats", () => {
           idx: "idx_stats_events_user_kind",
           stat: "1000000 10 1",
         },
+        { tbl: "stats_events", idx: null, stat: "1000000" },
         { tbl: "stats_meta", idx: null, stat: "1" },
         { tbl: "stats_log", idx: null, stat: "10" },
       ]),
@@ -268,7 +279,10 @@ describe("applyProductionStats", () => {
       await applyProductionStats(env.DB, { ...MODEL, tables });
       expect(
         (await liveStat1()).filter((row) => row.tbl === "stats_pairs"),
-      ).toEqual([{ tbl: "stats_pairs", idx: "stats_pairs", stat: "5000 1" }]);
+      ).toEqual([
+        { tbl: "stats_pairs", idx: null, stat: "5000" },
+        { tbl: "stats_pairs", idx: "stats_pairs", stat: "5000 1 1" },
+      ]);
 
       await applyProductionStats(env.DB, {
         tables,
@@ -277,10 +291,103 @@ describe("applyProductionStats", () => {
       expect(
         (await liveStat1()).filter((row) => row.tbl === "stats_pairs"),
       ).toEqual([
+        { tbl: "stats_pairs", idx: null, stat: "5000" },
         { tbl: "stats_pairs", idx: "stats_pairs", stat: "5000 50 1" },
       ]);
     } finally {
       await env.DB.exec("DROP TABLE stats_pairs");
+    }
+  });
+
+  // A default stat states every key prefix, as SQLite's own ANALYZE does:
+  // "<rows> 1" for a two-column index said nothing about the pair. Seeded
+  // over poisoned statistics (the README's poison-and-revert), the model with
+  // no entry for the index writes its full default and the planner takes the
+  // composite index for a two-column equality.
+  it("a composite index's default stat gives every key prefix", async () => {
+    await applySchema();
+    await env.DB.batch(
+      [
+        "DROP TABLE IF EXISTS stats_wide",
+        "CREATE TABLE stats_wide (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, c TEXT)",
+        "CREATE INDEX idx_stats_wide_a ON stats_wide(a)",
+        "CREATE INDEX idx_stats_wide_ab ON stats_wide(a, b)",
+      ].map((sql) => env.DB.prepare(sql)),
+    );
+    try {
+      const query = "SELECT c FROM stats_wide WHERE a = ? AND b = ?";
+      const plan = async () =>
+        (
+          await env.DB.prepare(`EXPLAIN QUERY PLAN ${query}`)
+            .bind(1, 2)
+            .all<{ detail: string }>()
+        ).results
+          .map((row) => row.detail)
+          .join("\n");
+      await env.DB.prepare("ANALYZE").run();
+      await env.DB.batch([
+        env.DB.prepare(
+          "INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('stats_wide', 'idx_stats_wide_a', '1000000 1')",
+        ),
+        env.DB.prepare(
+          "INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('stats_wide', 'idx_stats_wide_ab', '1000000 1000000 1000000')",
+        ),
+      ]);
+      await env.DB.prepare("ANALYZE sqlite_master").run();
+      expect(await plan()).toContain("idx_stats_wide_a ");
+
+      await applyProductionStats(env.DB, {
+        tables: { ...MODEL.tables, stats_wide: 1_000_000 },
+        indexes: { ...MODEL.indexes },
+      });
+      expect(await plan()).toContain("idx_stats_wide_ab");
+      expect(
+        (await liveStat1()).filter((row) => row.idx === "idx_stats_wide_ab"),
+      ).toEqual([
+        { tbl: "stats_wide", idx: "idx_stats_wide_ab", stat: "1000000 1 1" },
+      ]);
+    } finally {
+      await env.DB.exec("DROP TABLE stats_wide");
+    }
+  });
+
+  // SQLite takes a table's row count from its table-level row or a
+  // non-partial index's row, whichever loads last, and never from a partial
+  // index's row. A table whose only index is partial therefore needs the
+  // table-level row; and it must load first, so a non-partial index's row still
+  // sets the count where it would without one.
+  it("writes every table's count, before its index rows", async () => {
+    await applySchema();
+    await env.DB.batch(
+      [
+        "DROP TABLE IF EXISTS stats_partial",
+        "CREATE TABLE stats_partial (id INTEGER PRIMARY KEY, due INTEGER)",
+        "CREATE INDEX idx_stats_partial_due ON stats_partial(due) WHERE due IS NOT NULL",
+      ].map((sql) => env.DB.prepare(sql)),
+    );
+    try {
+      await applyProductionStats(env.DB, {
+        tables: { ...MODEL.tables, stats_partial: 25_000 },
+        indexes: { ...MODEL.indexes, idx_stats_partial_due: "1000 1" },
+      });
+      const ordered = (
+        await env.DB.prepare(
+          "SELECT tbl, idx, stat FROM sqlite_stat1 WHERE tbl IN ('stats_partial', 'stats_events') ORDER BY rowid",
+        ).all<SqliteStat1Row>()
+      ).results;
+      expect(ordered.filter((row) => row.tbl === "stats_partial")).toEqual([
+        { tbl: "stats_partial", idx: null, stat: "25000" },
+        { tbl: "stats_partial", idx: "idx_stats_partial_due", stat: "1000 1" },
+      ]);
+      const events = ordered.filter((row) => row.tbl === "stats_events");
+      expect(events[0]).toEqual({
+        tbl: "stats_events",
+        idx: null,
+        stat: "1000000",
+      });
+      expect(events.slice(1).every((row) => row.idx !== null)).toBe(true);
+    } finally {
+      await env.DB.exec("DROP TABLE stats_partial");
     }
   });
 });

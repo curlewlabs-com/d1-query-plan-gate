@@ -5,9 +5,9 @@
 //
 // sqlite_stat1.stat format: "<rows> [<avg_per_distinct_col1>
 // [<avg_per_distinct_(col1,col2)> ...]]", one value per key prefix, all >= 1.
-// A row giving fewer values than the index has columns leaves the rest at
-// whatever estimate SQLite already held; README.md sec."Known issues" says
-// where the default rows this module writes fall short of that format.
+// A row giving fewer values than the index has key columns states nothing
+// about the longer prefixes, so every row this module writes by default gives
+// one value per key column, as SQLite's own ANALYZE does.
 
 import type { PlanDatabase } from "./database";
 
@@ -18,8 +18,8 @@ export interface CardinalityModel {
   // production-shape statistics.
   readonly tables: Readonly<Record<string, number>>;
   // Full stat strings for the indexes whose default would mislead the
-  // planner. An index absent here gets "<table rows> 1": each key value
-  // assumed unique.
+  // planner. An index absent here gets "<table rows> 1 ... 1", one 1 per key
+  // column: each key prefix assumed unique.
   readonly indexes?: Readonly<Record<string, string>>;
 }
 
@@ -28,9 +28,13 @@ export interface CardinalityModel {
 // WITHOUT ROWID table, its primary-key index, which has no sqlite_master row
 // and which sqlite_stat1 records under the table's own name, so `name` is the
 // table name. The model's `indexes` keys such an entry by the table name too.
+// `columns` is the index's key width (`pragma_index_info`'s row count; for a
+// WITHOUT ROWID key, its primary-key columns), which the default stat needs to
+// give a value for every key prefix.
 export interface SchemaIndexRow {
   name: string;
   tbl_name: string;
+  columns: number;
 }
 
 export interface SqliteStat1Row {
@@ -78,21 +82,30 @@ export function buildSqliteStat1Rows(
     );
   };
 
-  const rows: SqliteStat1Row[] = schemaIndexes.map(({ name, tbl_name }) => ({
-    tbl: tbl_name,
-    idx: name,
-    stat: indexStats[name] ?? `${rowsOf(tbl_name)} 1`,
+  // Every table gets a table-level row (idx NULL), and every one comes before
+  // any index row. SQLite takes a table's row count from that row and from a
+  // non-partial index's row, whichever loads last, and never from a partial
+  // index's row; rows load in the order they were inserted. So a table whose
+  // indexes are all partial still gets the model's count, and one with a
+  // non-partial index ends on that index's first value, as it would without
+  // the table-level row.
+  const rows: SqliteStat1Row[] = schemaTableNames.map((name) => ({
+    tbl: name,
+    idx: null,
+    stat: String(rowsOf(name)),
   }));
-
-  // A table without any index still gets a row, with idx NULL - SQLite's
-  // convention for "table-level row count" - so the planner does not fall back
-  // to its default-large heuristic for it.
-  const tablesWithIndexes = new Set(schemaIndexes.map((row) => row.tbl_name));
-  for (const name of schemaTableNames) {
-    if (tablesWithIndexes.has(name)) continue;
-    rows.push({ tbl: name, idx: null, stat: String(rowsOf(name)) });
+  for (const { name, tbl_name, columns } of schemaIndexes) {
+    if (!Number.isInteger(columns) || columns < 1) {
+      throw new Error(
+        `index ${name} has no key width (${columns}); pass its key column count as \`columns\``,
+      );
+    }
+    rows.push({
+      tbl: tbl_name,
+      idx: name,
+      stat: indexStats[name] ?? `${rowsOf(tbl_name)}${" 1".repeat(columns)}`,
+    });
   }
-
   return rows;
 }
 
@@ -181,7 +194,9 @@ export async function applyProductionStats(
   const placeholders = tableNames.map(() => "?").join(",");
   const enumerated = await db
     .prepare(
-      `SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND tbl_name IN (${placeholders})`,
+      "SELECT m.name, m.tbl_name, " +
+        "(SELECT COUNT(*) FROM pragma_index_info(m.name)) AS columns " +
+        `FROM sqlite_master m WHERE m.type='index' AND m.tbl_name IN (${placeholders})`,
     )
     .bind(...tableNames)
     .all<SchemaIndexRow>();
@@ -190,13 +205,19 @@ export async function applyProductionStats(
   // be missing while the model claimed the table.
   const withoutRowid = await db
     .prepare(
-      "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND wr = 1",
+      "SELECT t.name, " +
+        "(SELECT COUNT(*) FROM pragma_table_info(t.name) WHERE pk > 0) AS columns " +
+        "FROM pragma_table_list t WHERE t.schema = 'main' AND t.type = 'table' AND t.wr = 1",
     )
-    .all<NameRow>();
+    .all<{ name: string; columns: number }>();
   const modeled = new Set(tableNames);
   const primaryKeys = withoutRowid.results
     .filter((row) => modeled.has(row.name))
-    .map((row) => ({ name: row.name, tbl_name: row.name }));
+    .map((row) => ({
+      name: row.name,
+      tbl_name: row.name,
+      columns: row.columns,
+    }));
 
   const rows = buildSqliteStat1Rows(model, tableNames, [
     ...enumerated.results,
