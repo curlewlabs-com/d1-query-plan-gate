@@ -25,7 +25,7 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.4.12",
-    "@cloudflare/workers-types": "5.20261026.1",
+    "@cloudflare/workers-types": "5.20261027.1",
     "prettier": "3.9.10",
     "typescript": "7.0.2",
     "vitest": "5.0.5",
