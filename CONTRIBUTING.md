@@ -1,8 +1,22 @@
 # Contributing
 
+Thanks for your interest in improving `d1-query-plan-gate`. The bar for a
+change is whether it keeps every plan an application runs on D1 held to what a
+reviewer has read. Bug fixes, plan-row shapes D1 prints that the parser does
+not read yet, SQL shapes the README's "Limits" says the lint misreads, and
+clearer docs are all welcome.
+
 Use the Bun release named in `.github/workflows/ci.yml`. Keep changes on a
 branch and open a pull request with the behavior change and the evidence that
 it works.
+
+## Before a large change
+
+Open an issue describing the problem first. A few choices carry the guarantee
+and are easy to undo by accident: the parser throws on a plan row or constraint
+term it cannot read rather than skip it, an acknowledgement is keyed on the
+exact plan pair, and plans are measured on D1's own engine rather than a host
+SQLite. A short discussion up front saves rework.
 
 ## Local checks
 
