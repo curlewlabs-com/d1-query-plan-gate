@@ -89,7 +89,7 @@ async function planOf(db: PlanDatabase, query: PlanQuery): Promise<string> {
   const statement = explainStatement(db, query);
   let rows: PlanRow[];
   try {
-    rows = (await statement.all<PlanRow>()).results ?? [];
+    rows = (await statement.all<PlanRow>()).results;
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
     return `${UNPLANNABLE} ${reason.replace(PREPARE_ERROR_OFFSET, "")}>`;
@@ -129,7 +129,15 @@ export async function planSweep(
   if (batched !== null) {
     const results = batched;
     return new Map(
-      queries.map(([name], i) => [name, renderPlan(results[i]!.results)]),
+      queries.map(([name], i) => {
+        const result = results[i];
+        if (result === undefined) {
+          throw new Error(
+            `d1-query-plan-gate: the batch returned no result for "${name}"`,
+          );
+        }
+        return [name, renderPlan(result.results)];
+      }),
     );
   }
   const plans = new Map<string, string>();

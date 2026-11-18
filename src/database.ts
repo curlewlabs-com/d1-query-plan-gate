@@ -100,5 +100,15 @@ export async function explainAll(
   const plans = await db.batch<PlanRow>(
     queries.map(([, query]) => explainStatement(db, query)),
   );
-  return new Map(queries.map(([name], i) => [name, plans[i]!.results]));
+  return new Map(
+    queries.map(([name], i) => {
+      const plan = plans[i];
+      if (plan === undefined) {
+        throw new Error(
+          `d1-query-plan-gate: the batch returned no result for "${name}"`,
+        );
+      }
+      return [name, plan.results];
+    }),
+  );
 }
