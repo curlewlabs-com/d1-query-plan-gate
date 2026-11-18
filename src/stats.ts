@@ -74,8 +74,12 @@ export function buildSqliteStat1Rows(
   }
 
   const rowsOf = (name: string): number => {
-    if (Object.prototype.hasOwnProperty.call(tableRows, name)) {
-      return tableRows[name]!;
+    const rows = tableRows[name];
+    if (
+      rows !== undefined &&
+      Object.prototype.hasOwnProperty.call(tableRows, name)
+    ) {
+      return rows;
     }
     throw new Error(
       `cardinality model is missing a table row count for: ${name}`,

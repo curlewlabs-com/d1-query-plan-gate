@@ -92,6 +92,19 @@ const POST_TABLE_KEYWORDS = new Set([
 // or [] (a doubled quote inside is a literal quote).
 const IDENTIFIER = String.raw`(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|\[[^\]]+\]|[a-z_]\w*)`;
 
+// A capture group its pattern makes mandatory. The throw names an edit to the
+// pattern that left a reader behind, instead of letting `undefined` flow on as
+// a table or index name.
+function group(match: RegExpExecArray, n: number): string {
+  const text = match[n];
+  if (text === undefined) {
+    throw new Error(
+      `d1-query-plan-gate: capture group ${n} of ${match[0]} did not match`,
+    );
+  }
+  return text;
+}
+
 function unquoteIdentifier(token: string): string {
   const open = token[0];
   if (open === '"') return token.slice(1, -1).replace(/""/g, '"');
@@ -127,12 +140,12 @@ function resolvePlanTables(
   const aliasToTable = new Map<string, string>();
   let mm: RegExpExecArray | null;
   while ((mm = tableRefRe.exec(sql)) !== null) {
-    const candidate = unquoteIdentifier(mm[1]!);
+    const candidate = unquoteIdentifier(group(mm, 1));
     if (userTableNames.has(candidate)) primaryTables.add(candidate);
   }
   let am: RegExpExecArray | null;
   while ((am = aliasRe.exec(sql)) !== null) {
-    const tbl = unquoteIdentifier(am[1]!);
+    const tbl = unquoteIdentifier(group(am, 1));
     if (!userTableNames.has(tbl)) continue;
     const aliasToken = am[2];
     if (!aliasToken) continue;
@@ -160,7 +173,7 @@ function withoutLiteralsAndComments(sql: string): string {
   let out = "";
   let i = 0;
   while (i < sql.length) {
-    const c = sql[i]!;
+    const c = sql.charAt(i);
     let end = -1;
     if (c === "'") {
       let j = i + 1;
@@ -259,10 +272,10 @@ function parseSearchSeek(
   let open = -1;
   let i = rest.length - 2;
   while (i >= 0) {
-    const c = rest[i]!;
+    const c = rest.charAt(i);
     if (c === ")") {
       let j = i - 1;
-      while (j >= 0 && WORD_CHAR_RE.test(rest[j]!)) j -= 1;
+      while (j >= 0 && WORD_CHAR_RE.test(rest.charAt(j))) j -= 1;
       if (j === i - 1 || j < 0 || rest[j] !== "(") return undefined;
       i = j - 1;
     } else if (c === "(") {
@@ -276,7 +289,7 @@ function parseSearchSeek(
   const method = rest.slice(0, open).trim();
   if (method === "") return undefined;
   return {
-    target: head[1]!,
+    target: group(head, 1),
     method,
     constraint: rest.slice(open + 1, rest.length - 1),
   };
@@ -303,12 +316,12 @@ function constraintTerms(constraint: string, detail: string): ConstraintTerm[] {
     const comparison = CONSTRAINT_TERM_RE.exec(term);
     if (comparison) {
       return {
-        column: comparison[1]!,
+        column: group(comparison, 1),
         op: comparison[2] as ConstraintTerm["op"],
       };
     }
     const skipScan = SKIP_SCAN_TERM_RE.exec(term);
-    if (skipScan) return { column: skipScan[1]!, op: "ANY" };
+    if (skipScan) return { column: group(skipScan, 1), op: "ANY" };
     throw new Error(
       `d1-query-plan-gate cannot read the constraint term "${term}" in "${detail}"; its shape needs adding to constraintTerms before the range rule or the key groups can classify it`,
     );
@@ -331,7 +344,7 @@ const VIRTUAL_TABLE_ROW_RE = /^(?:SCAN|SEARCH)\s+(\w+)\s+VIRTUAL TABLE\b/;
 export function planVirtualTableSources(plan: readonly PlanRow[]): string[] {
   return plan.flatMap((row) => {
     const match = VIRTUAL_TABLE_ROW_RE.exec(planAccessDetail(row.detail));
-    return match ? [match[1]!] : [];
+    return match ? [group(match, 1)] : [];
   });
 }
 
@@ -345,8 +358,8 @@ export function parseSearchRow(detail: string): SearchRow | undefined {
   const virtual = SEARCH_VIRTUAL_TABLE_RE.exec(normalized);
   if (virtual) {
     return {
-      target: virtual[1]!,
-      method: virtual[2]!,
+      target: group(virtual, 1),
+      method: group(virtual, 2),
       constraint: undefined,
       terms: undefined,
     };
@@ -354,7 +367,7 @@ export function parseSearchRow(detail: string): SearchRow | undefined {
   const end = SEARCH_END_SEEK_RE.exec(normalized);
   if (end) {
     return {
-      target: end[1]!,
+      target: group(end, 1),
       method: end[2],
       constraint: undefined,
       terms: undefined,
@@ -396,7 +409,7 @@ export function qScanFindings(
   for (const row of plan) {
     const m = scanRe.exec(planAccessDetail(row.detail));
     if (!m) continue;
-    const target = m[1]!;
+    const target = group(m, 1);
     const realTable = userTableNames.has(target)
       ? target
       : aliasToTable.get(target);
@@ -411,7 +424,7 @@ export function qScanFindings(
     if (
       ridesPartial &&
       partialIndexBoundsWorkingSet(
-        usingIndex!,
+        usingIndex,
         realTable,
         modeledIndexRows,
         parentRowCounts,
@@ -431,7 +444,7 @@ export function qScanFindings(
         table: realTable,
         q: qName,
         index: usingIndex,
-        detail: `${qName} plan: ${row.detail} - partial index walks ~${modeledIndexRows.get(usingIndex!) ?? "?"} rows, not an order of magnitude below the ${parentRowCounts.get(realTable) ?? "?"}-row ${realTable} (in-flight set is unbounded)`,
+        detail: `${qName} plan: ${row.detail} - partial index walks ~${modeledIndexRows.get(usingIndex) ?? "?"} rows, not an order of magnitude below the ${parentRowCounts.get(realTable) ?? "?"}-row ${realTable} (in-flight set is unbounded)`,
       });
     } else {
       findings.push({
@@ -525,15 +538,14 @@ export function qRangeSearchFindings(
   const findings: QueryPlanFinding[] = [];
   for (const row of plan) {
     const search = parseSearchRow(row.detail);
-    if (search?.terms === undefined) continue;
-    const { target, terms } = search;
-    const method = search.method!;
+    if (search?.terms === undefined || search.method === undefined) continue;
+    const { target, terms, method } = search;
     const realTable = userTableNames.has(target)
       ? target
       : aliasToTable.get(target);
     if (!realTable) continue;
     const idxMatch = indexRe.exec(method);
-    const usingIndex = idxMatch ? idxMatch[1]! : method;
+    const usingIndex = idxMatch ? group(idxMatch, 1) : method;
     let hasLower = false;
     let hasUpper = false;
     for (const { op } of terms) {
@@ -705,16 +717,22 @@ export function qKeyGroups(
   const groups: KeyGroup[] = [];
   for (const row of plan) {
     const search = parseSearchRow(row.detail);
-    if (search?.constraint === undefined) continue;
-    const indexMatch = indexRe.exec(search.method!);
+    if (
+      search?.constraint === undefined ||
+      search.method === undefined ||
+      search.terms === undefined
+    ) {
+      continue;
+    }
+    const indexMatch = indexRe.exec(search.method);
     if (!indexMatch) {
-      if (rowidRe.test(search.method!)) continue;
+      if (rowidRe.test(search.method)) continue;
       throw new Error(
         `d1-query-plan-gate has no key-group reading for the access method "${search.method}" in "${row.detail}"; it needs classifying in qKeyGroups before a roster can see its seekers`,
       );
     }
     const { target, constraint } = search;
-    const index = indexMatch[1]!;
+    const index = group(indexMatch, 1);
     const realTable = userTableNames.has(target)
       ? target
       : aliasToTable.get(target);
@@ -729,7 +747,7 @@ export function qKeyGroups(
     // UNIQUE(a_id, b_id)) pins a group, not a key, so it stays. `<expr>` is
     // left out: an expression column has no name to count against, which is
     // why the index's named-column count is absent below.
-    const equalityTerms = search.terms!.filter(
+    const equalityTerms = search.terms.filter(
       (term) => term.op === "=" && term.column !== "<expr>",
     ).length;
     const namedColumns = indexNamedColumnCounts.get(index);
