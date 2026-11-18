@@ -22,7 +22,6 @@ SQLite. A short discussion up front saves rework.
 
 ```sh
 bun install --frozen-lockfile
-bun run format:check
 bun run typecheck
 bun run test
 ```
