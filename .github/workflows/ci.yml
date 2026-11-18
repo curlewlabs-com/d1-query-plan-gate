@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
+  test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -51,8 +51,6 @@ jobs:
             if (files.some((f) => f.startsWith("test/"))) process.exit(1);
           ' "$RUNNER_TEMP/pack.json"
 
-  # The one check branch protection requires, so adding a job means adding it
-  # here rather than editing the repository's settings.
   baseline:
     # The checks every Curlew Labs repository runs, in one place:
     # https://github.com/curlewlabs-com/ci-baseline
@@ -64,13 +62,15 @@ jobs:
           persist-credentials: false
       - uses: curlewlabs-com/ci-baseline@f05f17a38ba2dfbaf0cde130a375b346e9a923a2 # v0.2.0
 
+  # The one check branch protection requires, so adding a job means adding it
+  # to needs here rather than editing the repository's settings.
   conclusion:
-    needs: [check, baseline]
+    needs: [test, baseline]
     runs-on: ubuntu-24.04
     if: always()
     steps:
       - name: Require every job to pass
         env:
-          CHECK: ${{ needs.check.result }}
+          TEST: ${{ needs.test.result }}
           BASELINE: ${{ needs.baseline.result }}
-        run: test "$CHECK" = success && test "$BASELINE" = success
+        run: test "$TEST" = success && test "$BASELINE" = success
