@@ -106,3 +106,9 @@ A published release is immutable: publishing locks the tag and the tarball, and
 the fixed-version-tag ruleset keeps the tag from being moved or deleted. A
 mistake found after publishing is fixed in a new version; a fixed version tag
 or a published release asset is never replaced.
+
+## License
+
+By submitting a contribution for inclusion in this project, you agree that it
+is licensed under the MIT and Apache-2.0 licenses, as the README's License
+section describes, without any additional terms or conditions.

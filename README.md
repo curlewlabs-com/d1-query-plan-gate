@@ -300,4 +300,15 @@ any differently.
 
 ## License
 
-MIT. Copyright (c) 2026 Curlew Labs.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Releases published under the MIT license alone may also be used
+under either license.
+
+### Contribution
+
+By submitting a contribution for inclusion in this project, you agree that it
+is dual licensed as above, without any additional terms or conditions.
