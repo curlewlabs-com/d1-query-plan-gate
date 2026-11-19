@@ -57,7 +57,7 @@ The package is `@curlewlabs-com/d1-query-plan-gate`. It is not on the npm
 registry: install it from the GitHub release tarball, with an exact pin:
 
 ```sh
-bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.4.0/curlewlabs-com-d1-query-plan-gate-0.4.0.tgz
+bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.4.1/curlewlabs-com-d1-query-plan-gate-0.4.1.tgz
 ```
 
 The package ships TypeScript sources; Vitest, Wrangler and Bun compile them.
