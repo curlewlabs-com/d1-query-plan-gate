@@ -1,6 +1,6 @@
 {
   "name": "@curlewlabs-com/d1-query-plan-gate",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Hold Cloudflare D1 query plans to what a reviewer has read: plan moves per schema delta, a SCAN and unbounded-range plan lint, and production-shape sqlite_stat1 statistics for tests.",
   "license": "MIT OR Apache-2.0",
   "author": "Curlew Labs",
