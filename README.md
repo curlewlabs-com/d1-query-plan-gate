@@ -1,5 +1,20 @@
 # d1-query-plan-gate
 
+An index seek can still walk an entire queue to return one job. With an index
+on `jobs(queue, created)`, these queries can print the same
+`SEARCH jobs USING INDEX queue_time (queue=?)` plan:
+
+```sql
+SELECT * FROM jobs WHERE queue = ? ORDER BY created LIMIT 1;
+SELECT * FROM jobs WHERE queue = ? AND ready = 1 ORDER BY created LIMIT 1;
+```
+
+`explainIndexWalks` reads SQLite's compiled `EXPLAIN` program alongside the
+plan. The first seek has an empty filter list. The second reports
+`ready(Ne 1)`: SQLite advances past an entry when its ready flag fails the
+comparison. This works on an empty test database. How many entries it will
+actually visit depends on the data.
+
 ## What it is
 
 A TypeScript library for test suites that run against
@@ -57,7 +72,7 @@ The package is `@curlewlabs-com/d1-query-plan-gate`. It is not on the npm
 registry: install it from the GitHub release tarball, with an exact pin:
 
 ```sh
-bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.4.1/curlewlabs-com-d1-query-plan-gate-0.4.1.tgz
+bun add https://github.com/curlewlabs-com/d1-query-plan-gate/releases/download/v0.5.0/curlewlabs-com-d1-query-plan-gate-0.5.0.tgz
 ```
 
 The package ships TypeScript sources; Vitest, Wrangler and Bun compile them.
@@ -248,6 +263,23 @@ which shift whenever a statement's program grows (any write to a table gains
 index-maintenance code when an index is added) without its rows being found
 any differently.
 
+### Reviewing filters after a seek
+
+```ts
+const plans = await explainIndexWalks(env.DB, queries);
+for (const [name, query] of queries) {
+  const groups = qKeyGroups(query.sql, plans.get(name)!, context);
+  const ids = groups.map(keyGroupId);
+  // Compare these IDs and their seeking queries with the decisions in your test.
+}
+```
+
+Pass named statements and the same key-group context used by the plan lint.
+The returned plan rows carry a sorted `residual` list for each paired index
+walk. Groups with filters include them in their ID. Record why a group is
+bounded or exercise a rows-read budget with data that makes it walk.
+Changes to the filters then put that decision back in review.
+
 ## Limits
 
 - Tested on D1 in the Workers test runtime only. Any database object with the
@@ -292,10 +324,20 @@ any differently.
   recipe under "How to use it" builds each side against its own schema.
 - `sqlite_stat4` is not available on D1, so range-distribution-aware choices
   are out of reach; the planner works from `sqlite_stat1` row counts.
-- The lint reads what the plan prints. A residual filter on a column outside
-  the chosen index, or a lower bound against a fixed constant rather than a
-  moving window, is invisible to it; only a measured rows-read budget catches
-  those.
+- The plan-only lint sees the seek key. The optional bytecode reader reports
+  recognized branches that reject entries after the seek. It does not measure
+  join selectivity (an inner seek can find no row for an outer entry) or
+  establish a rows-read bound. A bound against a fixed constant can still
+  admit an ever-growing range.
+- SQLite's code generator determines loop shape, instruction order, and opcode
+  meanings. The shape tests run on D1; a new engine version can require a new
+  reading. The reader throws when counts or key widths prevent pairing a
+  plan's index walks with the program. An operand it cannot trace is
+  `<expr>`: comparisons against `? - 60` and `? - 120` can have the same ID.
+  Likewise the list records comparisons that branch to the loop step, not
+  a full SQL predicate: a short-circuit condition can bypass that branch.
+  Collations and comparison flags are not part of the ID. Use a stable main
+  schema and statistics throughout the sweep.
 - Version 0.x carries no compatibility promise between minor versions.
 
 ## License
