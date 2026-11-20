@@ -25,6 +25,14 @@ beforeAll(async () => {
       "CREATE TABLE edges (id INTEGER PRIMARY KEY, src INTEGER, dst INTEGER, active INTEGER, visible INTEGER)",
       "CREATE INDEX outgoing ON edges(src, dst)",
       "CREATE INDEX incoming ON edges(dst)",
+      "CREATE TABLE tickets (serial INTEGER, region TEXT, priority INTEGER, ready INTEGER, urgent INTEGER, PRIMARY KEY(region, serial)) WITHOUT ROWID",
+      "CREATE INDEX ticket_priority ON tickets(priority)",
+      "CREATE TABLE samples (bucket INTEGER, reading INTEGER, valid INTEGER)",
+      "CREATE INDEX by_bucket ON samples(bucket, reading)",
+      // Many readings share a prefix, making both skip optimizations worthwhile.
+      "ANALYZE samples",
+      "INSERT INTO sqlite_stat1 VALUES ('samples','by_bucket','100000 1000 1')",
+      "ANALYZE sqlite_master",
     ].join(";\n"),
   );
 });
@@ -104,6 +112,57 @@ describe("post-seek filters", () => {
         )
       )[0]?.residual,
     ).toEqual(["<expr>(Lt <expr>)"]);
+  });
+
+  it("pairs an equality skip-scan with its constrained seek", async () => {
+    const rows = await walk(
+      "SELECT * FROM samples WHERE reading=? AND valid=1 LIMIT 1",
+      1,
+    );
+    expect(rows).toEqual([
+      expect.objectContaining({
+        detail: expect.stringContaining("ANY(bucket) AND reading=?"),
+        residual: ["valid(Ne 1)"],
+      }),
+    ]);
+  });
+
+  it("keeps DISTINCT's skip-ahead inside its index walk", async () => {
+    const sql = "SELECT DISTINCT bucket FROM samples WHERE valid=1";
+    // A Next-only plan would also pair, without exercising the second seek.
+    const opcodes = await env.DB.prepare(`EXPLAIN ${sql}`).all<{
+      opcode: string;
+    }>();
+    expect(opcodes.results.map((row) => row.opcode)).toContain("SeekGT");
+    expect(await walk(sql)).toEqual([
+      expect.objectContaining({
+        residual: expect.arrayContaining(["valid(Ne 1)"]),
+      }),
+    ]);
+  });
+
+  it("keeps an explicit cast distinct from the original stored value", async () => {
+    const select = (value: string) =>
+      walk(`SELECT * FROM jobs WHERE queue=? AND ${value}=1 LIMIT 1`, 1);
+    expect((await select("ready"))[0]?.residual).toEqual(["ready(Ne 1)"]);
+    expect((await select("CAST(ready AS INTEGER)"))[0]?.residual).toEqual([
+      "<expr>(Ne 1)",
+    ]);
+  });
+
+  it("attributes off-index columns fetched by a composite primary key to the index entry", async () => {
+    for (const field of ["ready", "urgent"]) {
+      const rows = await walk(
+        `SELECT * FROM tickets WHERE priority=? AND ${field}=1 LIMIT 1`,
+        1,
+      );
+      expect(rows).toEqual([
+        expect.objectContaining({
+          detail: expect.stringContaining("INDEX ticket_priority"),
+          residual: [`${field}(Ne 1)`],
+        }),
+      ]);
+    }
   });
 
   it("keeps arithmetic and correlated subquery rejections visible", async () => {

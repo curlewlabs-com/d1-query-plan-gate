@@ -38,6 +38,7 @@ import {
 // The schema facts the bytecode names by number: which b-tree a root page is,
 // and each b-tree's columns in the order a Column opcode counts them.
 export interface BytecodeContext {
+  primaryKeyWidths: ReadonlyMap<string, number>;
   objectsByRootPage: ReadonlyMap<
     number,
     { name: string; type: "table" | "index"; table: string }
@@ -97,6 +98,31 @@ export function indexSeeks(
 ): IndexSeek[] {
   const restart = rows.findIndex((row, i) => i > 0 && row.addr === 0);
   return programSeeks(restart === -1 ? rows : rows.slice(0, restart), ctx);
+}
+
+function isPrimaryKeyFetch(
+  program: readonly BytecodeRow[],
+  lookup: BytecodeRow,
+  cursor: number,
+  index: { name: string; table: string },
+  ctx: BytecodeContext,
+): boolean {
+  const width = ctx.primaryKeyWidths.get(index.table);
+  if (width === undefined || Number(lookup.p4) !== width) return false;
+  const tableSlots = ctx.columnsByObject.get(index.table);
+  const indexSlots = ctx.columnsByObject.get(index.name);
+  for (let slot = 0; slot < width; slot++) {
+    const load = program[lookup.addr - width + slot];
+    if (
+      load?.opcode !== "Column" ||
+      load.p1 !== cursor ||
+      load.p3 !== lookup.p3 + slot ||
+      !tableSlots?.[slot] ||
+      indexSlots?.[load.p2] !== tableSlots[slot]
+    )
+      return false;
+  }
+  return true;
 }
 
 function programSeeks(
@@ -187,9 +213,11 @@ function programSeeks(
   };
 
   const seeks: IndexSeek[] = [];
-  const stepsSeen = new Set<number>();
+  const seeksByStep = new Map<number, IndexSeek>();
+  const advances = new Set<number>();
   for (const start of program) {
-    if (!WALK_START_OPCODES.has(start.opcode)) continue;
+    if (!WALK_START_OPCODES.has(start.opcode) || advances.has(start.addr))
+      continue;
     const object = objectAt(start.p1, start.addr);
     if (object?.type !== "index") continue;
     const cursor = start.p1;
@@ -212,12 +240,29 @@ function programSeeks(
       seeks.push({ index: object.name, startKeyFields, residual: [] });
       continue;
     }
-    // A skip-scan starts one loop twice - a Rewind for the first key prefix,
-    // then a Seek past each prefix it has done with - and the plan lists it
-    // once, so the loop is the walk and its first start stands for it.
-    if (stepsSeen.has(step.addr)) continue;
-    stepsSeen.add(step.addr);
+    // A skip-scan positions this loop on successive prefixes and then seeks
+    // its constrained key within each prefix. EQP describes the latter.
+    const existing = seeksByStep.get(step.addr);
+    if (existing) {
+      existing.startKeyFields = Math.max(
+        existing.startKeyFields,
+        startKeyFields,
+      );
+      continue;
+    }
     const { body, jumps, calls } = loopRejections(program, step, predecessors);
+    // DISTINCT can jump straight to the next distinct prefix. This seek
+    // resumes the same loop at its normal entry instead of starting a walk.
+    for (const row of body) {
+      const next = program[row.addr + 1];
+      if (
+        (row.opcode === "SeekGT" || row.opcode === "SeekLT") &&
+        row.p1 === cursor &&
+        next?.opcode === "Goto" &&
+        next.p2 === step.p2
+      )
+        advances.add(row.addr);
+    }
     // The cursors the loop reads the sought row through: the index's own, and
     // the table cursor a DeferredSeek moves to the entry's rowid.
     const rowCursors = new Set([cursor]);
@@ -227,6 +272,18 @@ function programSeeks(
     for (const row of body) {
       if (row.opcode === "DeferredSeek" && row.p1 === cursor) {
         rowCursors.add(row.p3);
+      }
+      // A secondary index on a WITHOUT ROWID table carries its primary key.
+      // SQLite loads the whole key into consecutive registers immediately
+      // before NotFound positions the table. Verify the source slots as well
+      // as the destination table so a self-join probe stays a rejection.
+      if (
+        row.opcode === "NotFound" &&
+        objectAt(row.p1, row.addr)?.name === object.table &&
+        isPrimaryKeyFetch(program, row, cursor, object, ctx)
+      ) {
+        rowCursors.add(row.p1);
+        jumps.delete(row);
       }
       if (POSITIONING.has(row.opcode)) movedInBody.add(row.p1);
       if (row.opcode === "DeferredSeek") movedInBody.add(row.p3);
@@ -361,21 +418,23 @@ function programSeeks(
         residual.add(`<expr>(${jump.opcode})`);
       }
     }
-    seeks.push({
+    const seek = {
       index: object.name,
       startKeyFields,
       residual: [...residual].sort(),
-    });
+    };
+    seeks.push(seek);
+    seeksByStep.set(step.addr, seek);
   }
   return seeks;
 }
 
-// The index a plan row walks, SEARCH or SCAN, and how many of its terms are
-// equalities, or undefined for a row that walks no index. A SCAN counts as a
+// The index a plan row walks, SEARCH or SCAN, and how many key fields its
+// equality and skip-scan prefixes occupy, or undefined for a row that walks no index. A SCAN counts as a
 // SEARCH does: the bytecode starts a walk for each.
 function planRowWalk(
   detail: string,
-): { index: string; equalities: number; terms: number } | undefined {
+): { index: string; prefixFields: number; terms: number } | undefined {
   const search = parseSearchRow(detail);
   if (search !== undefined) {
     const index = /^(?:COVERING\s+)?INDEX\s+(\w+)$/.exec(
@@ -387,7 +446,7 @@ function planRowWalk(
     const terms = search.terms ?? [];
     return {
       index,
-      equalities: terms.filter((t) => t.op === "=").length,
+      prefixFields: terms.filter((t) => t.op === "=" || t.op === "ANY").length,
       terms: terms.length,
     };
   }
@@ -396,13 +455,13 @@ function planRowWalk(
   )?.[1];
   return scan === undefined
     ? undefined
-    : { index: scan, equalities: 0, terms: 0 };
+    : { index: scan, prefixFields: 0, terms: 0 };
 }
 
 // Each index walk in a statement's plan paired with its residual, in plan
 // order. Throws when the plan and the bytecode disagree on how many walks an
 // index takes, or a paired walk starts from a key wider or narrower than its
-// plan row's terms allow - the equalities, plus at most the range bound the
+// plan row's terms allow - the equality and skip-scan prefix, plus at most the range bound the
 // walk starts from, or SQLite's NULL-skipping lower bound - since pairing by
 // order is then pairing by guess.
 export function residualByPlanRow(
@@ -412,13 +471,13 @@ export function residualByPlanRow(
 ): Map<PlanRow, readonly string[]> {
   const planRowsByIndex = new Map<
     string,
-    { row: PlanRow; equalities: number; terms: number }[]
+    { row: PlanRow; prefixFields: number; terms: number }[]
   >();
   for (const row of plan) {
     const walk = planRowWalk(row.detail);
     if (walk === undefined) continue;
     const rows = planRowsByIndex.get(walk.index) ?? [];
-    rows.push({ row, equalities: walk.equalities, terms: walk.terms });
+    rows.push({ row, prefixFields: walk.prefixFields, terms: walk.terms });
     planRowsByIndex.set(walk.index, rows);
   }
   const seeksByIndex = new Map<string, IndexSeek[]>();
@@ -437,15 +496,15 @@ export function residualByPlanRow(
         `${qName}: EXPLAIN QUERY PLAN lists ${rows.length} walk(s) on ${index} and the bytecode starts ${walks.length}; residual-walks.ts cannot pair them`,
       );
     }
-    rows.forEach(({ row, equalities, terms }, i) => {
+    rows.forEach(({ row, prefixFields, terms }, i) => {
       const walk = walks[i];
       if (
         walk === undefined ||
-        walk.startKeyFields < equalities ||
-        walk.startKeyFields > Math.min(terms, equalities + 1) + 1
+        walk.startKeyFields < prefixFields ||
+        walk.startKeyFields > Math.min(terms, prefixFields + 1) + 1
       ) {
         throw new Error(
-          `${qName}: the plan row "${row.detail}" has ${equalities} equality term(s) of ${terms}, and the walk paired with it starts from ${walk?.startKeyFields} key field(s); residual-walks.ts has paired the wrong walks`,
+          `${qName}: the plan row "${row.detail}" has ${prefixFields} prefix field(s) of ${terms}, and the walk paired with it starts from ${walk?.startKeyFields} key field(s); residual-walks.ts has paired the wrong walks`,
         );
       }
       paired.set(row, walk.residual);

@@ -122,6 +122,7 @@ const REGISTER_WRITES: Readonly<
   Column: (r) => [r.p3],
   Rowid: (r) => [r.p2],
   IdxRowid: (r) => [r.p2],
+  Cast: (r) => [r.p1],
   Integer: (r) => [r.p2],
   Int64: (r) => [r.p2],
   Real: (r) => [r.p2],
@@ -177,7 +178,6 @@ const REGISTER_WRITES: Readonly<
 const REGISTER_NEUTRAL = new Set([
   "Affinity",
   "RealAffinity",
-  "Cast",
   "MustBeInt",
   ...COMPARE_OPCODES,
   ...SINGLE_OPERAND_TESTS,

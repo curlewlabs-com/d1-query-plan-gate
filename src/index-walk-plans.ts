@@ -36,11 +36,12 @@ async function readContext(db: PlanDatabase): Promise<BytecodeContext> {
         AND m.tbl_name NOT GLOB 'sqlite_*' AND m.tbl_name NOT GLOB '_cf_*'
         AND m.tbl_name NOT GLOB 'd1_*'
     )
-    SELECT o.*, c.cid AS slot, c.name AS col FROM objects o
+    SELECT o.*, c.cid AS slot, c.name AS col, 0 AS pk FROM objects o
     CROSS JOIN pragma_table_xinfo(o.name) c
     WHERE o.type = 'table' AND o.wr = 0 AND c.hidden != 2
     UNION ALL
-    SELECT o.*, c.seqno AS slot, CASE WHEN c.cid = -1 THEN 'rowid' ELSE c.name END AS col
+    SELECT o.*, c.seqno AS slot, CASE WHEN c.cid = -1 THEN 'rowid' ELSE c.name END AS col,
+      o.type = 'table' AND c.key AS pk
     FROM objects o CROSS JOIN pragma_index_xinfo(o.name) c
     WHERE o.type = 'index' OR o.wr = 1
     ORDER BY rootpage, slot
@@ -51,12 +52,14 @@ async function readContext(db: PlanDatabase): Promise<BytecodeContext> {
       type: "table" | "index";
       tbl_name: string;
       rootpage: number;
+      pk: number;
       col: string | null;
     }>();
   const objectsByRootPage = new Map<
     number,
     { name: string; type: "table" | "index"; table: string }
   >();
+  const primaryKeyWidths = new Map<string, number>();
   const columnsByObject = new Map<string, (string | null)[]>();
   for (const row of results) {
     let columns = columnsByObject.get(row.name);
@@ -70,8 +73,9 @@ async function readContext(db: PlanDatabase): Promise<BytecodeContext> {
       });
     }
     columns.push(row.col);
+    if (row.pk) primaryKeyWidths.set(row.name, columns.length);
   }
-  return { objectsByRootPage, columnsByObject };
+  return { objectsByRootPage, columnsByObject, primaryKeyWidths };
 }
 
 export async function explainIndexWalks(
