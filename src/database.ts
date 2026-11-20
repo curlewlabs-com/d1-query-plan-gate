@@ -56,9 +56,19 @@ export function explainSql(query: PlanQuery): {
   sql: string;
   binds: string[];
 } {
+  return explainText(query, "EXPLAIN QUERY PLAN");
+}
+
+export function explainText(
+  query: PlanQuery,
+  command: "EXPLAIN" | "EXPLAIN QUERY PLAN",
+): {
+  sql: string;
+  binds: string[];
+} {
   explainSequence += 1;
   return {
-    sql: `EXPLAIN QUERY PLAN /* plan ${explainSequence} */ ${query.sql}`,
+    sql: `${command} /* plan ${explainSequence} */ ${query.sql}`,
     binds: Array.from({ length: query.bindCount ?? 0 }, () => PLACEHOLDER_BIND),
   };
 }

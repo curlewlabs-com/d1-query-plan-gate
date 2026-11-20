@@ -15,6 +15,7 @@
 // A finding is a candidate, not a verdict: the caller subtracts its own
 // audited exceptions, keyed by (rule, table, index, query).
 
+import type { IndexWalkPlanRow } from "./index-walk-plans";
 import type { PlanRow } from "./database";
 
 export type PlanLintRule =
@@ -500,8 +501,8 @@ export function qScanFindings(
 // only the seek keys - residual filters are not emitted - so this rule sees a
 // bounded recent-window seek while the seek walks every row in that window and
 // discards the non-matching ones. The structural fix is to lead the index with
-// the residual column so it becomes a seek key; detection needs a rows-read
-// measurement, which no EXPLAIN-based reader provides.
+// the residual column so it becomes a seek key. explainIndexWalks identifies
+// post-seek tests; a rows-read measurement tells how much they cost.
 //
 // Scope: reads only. A DELETE/UPDATE retention sweep runs a `ts < cutoff` range
 // on purpose - seeking the OLD end via the index is the ideal retention shape,
@@ -605,6 +606,8 @@ export function qRangeSearchFindings(
 // ---------------------------------------------------------------------------
 
 export interface KeyGroup {
+  // Present on a group with post-seek filters measured by explainIndexWalks.
+  residual?: readonly string[];
   table: string;
   index: string;
   constraint: string;
@@ -642,7 +645,10 @@ export function keyGroupId(group: KeyGroup): string {
     group.partialPredicate === undefined
       ? group.index
       : `${group.index} WHERE ${group.partialPredicate}`;
-  return `${group.table} | ${index} | (${group.constraint})`;
+  const id = `${group.table} | ${index} | (${group.constraint})`;
+  return group.residual?.length
+    ? `${id} | filters ${group.residual.join(", ")}`
+    : id;
 }
 
 // A statement whose result set is structurally bounded regardless of how much
@@ -694,7 +700,7 @@ function usesIsComparison(sql: string): boolean {
 // SQLite lists for a parent-table write are not enrolled.
 export function qKeyGroups(
   sql: string,
-  plan: readonly PlanRow[],
+  plan: readonly IndexWalkPlanRow[],
   ctx: KeyGroupContext,
 ): KeyGroup[] {
   if (!hasStructurallyBoundedResult(sql)) return [];
@@ -763,6 +769,7 @@ export function qKeyGroups(
     }
     const partialPredicate = ctx.partialIndexPredicates.get(index);
     groups.push({
+      ...(row.residual?.length ? { residual: row.residual } : {}),
       table: realTable,
       index,
       constraint,
